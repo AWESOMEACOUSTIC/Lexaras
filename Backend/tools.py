@@ -10,7 +10,7 @@ from rich import print
 
 load_dotenv()
 
-tavily = TavilyClient(api_key=os.getenv("tavily_api_key"))
+tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 @tool
 def web_search(query : str) -> str:
