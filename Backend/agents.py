@@ -3,8 +3,8 @@ What is the difference between using old create_react agent and the modern new w
 What has been changed and how this modern approach is better than the old one? 
 """
 
-from Backend.agents import chain
-from langchain.agents import create_agent
+
+from langgraph.prebuilt import create_react_agent
 from tools import web_search, scrape_url
 from langchain_mistralai import ChatMistralAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -18,33 +18,32 @@ load_dotenv()
 
 
 mistral = ChatMistralAI(
-    model="mistral-large-latest",
+    model="mistral-small-2603",
     api_key=os.getenv("MISTRAL_API_KEY")
 )
 
 def build_search_agent(query : str):
-    return create_agent(
+    return create_react_agent(
         model=mistral,
         tools=[web_search],
-        system_prompt=f"""
+        prompt=f"""
         You are a helpful assistant specialized in answering user queries. 
+        Your current research topic is: {query}.
         You have access to a web search tool that can be used to find information on the internet.
         """,
-        input_variables=["query"],
-        verbose=True
     )
 
 
-def build_reader_agent(urls : list[str]) -> create_agent:
-    return create_agent(
+def build_reader_agent(urls : list[str]):
+    return create_react_agent(
         model=mistral,
         tools=[scrape_url],
-        system_prompt=f"""
-        You are a helpful assistant specialized in summarizing web content given as URLs.
-        You have access to a scraper tool that can be used to scrape content from given URLs.
+        prompt=f"""
+        You are a helpful assistant specialized in summarizing web content.
+        You have access to a scraper tool.
+        You may need to scrape the following URLs:
+        {chr(10).join(urls)}
         """,
-        input_variables=["query"],
-        verbose=True
     )
 
 #writer chain
@@ -93,7 +92,3 @@ critic_prompt = ChatPromptTemplate.from_messages([
 ])
 
 critic_chain = critic_prompt | mistral | output_parser
-
-#Test the chain
-response = chain.invoke({"input": "Hello, how are you?"})
-print(response)
