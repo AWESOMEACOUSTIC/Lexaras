@@ -79,3 +79,9 @@ python-decouple>=3.8
 # Logging & Observability (optional but recommended)
 # ------------------------------------------------------------
 langsmith>=0.2.0
+
+
+#
+# User Interface
+#
+streamlit>=1.35.0
