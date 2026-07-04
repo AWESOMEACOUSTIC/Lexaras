@@ -30,10 +30,13 @@ _EVALUATOR_SYSTEM = textwrap.dedent("""
        or merely summarise each one individually? Are there insightful connections?
     4. Citation Integrity (0–10): Is every claim backed by a traceable source?
        Are URLs valid and present? Is there any content that appears fabricated?
+    5. Recency (0–10): Are the referenced papers and sources recent? Are they primarily
+       newer publications from the last 5 years? Flag if the report relies heavily on
+       outdated studies when newer work is available.
 
     OUTPUT CONSTRAINTS:
     - Return ONLY valid JSON. No preamble, no markdown fences.
-    - overall_score = (relevance*0.3 + coverage*0.25 + synthesis*0.3 + citation*0.15)
+    - overall_score = (relevance*0.25 + coverage*0.2 + synthesis*0.25 + citation*0.15 + recency*0.15)
     - improvement_suggestions must be specific and actionable, not vague.
 """).strip()
 
@@ -58,6 +61,7 @@ _EVALUATOR_HUMAN = textwrap.dedent("""
         "coverage_score": <0-10>,
         "synthesis_score": <0-10>,
         "citation_score": <0-10>,
+        "recency_score": <0-10>,
         "overall_score": <float>,
         "strengths": ["...", "..."],
         "weaknesses": ["...", "..."],
@@ -87,10 +91,18 @@ def node_evaluator(state: AgentState) -> AgentState:
     logger.info("[Evaluator] Starting | topic=%r", topic)
     start = time.perf_counter()
 
+    # Build a lookup for discovered papers metadata
+    paper_lookup = {p["url"].strip().rstrip("/").lower(): p for p in papers if "url" in p}
+
     # Build a compact contexts summary for the evaluator prompt
     ctx_lines: list[str] = []
     for ctx in contexts[:5]:   # cap at 5 to stay within token budget
-        ctx_lines.append(f"- {ctx.get('url', 'N/A')}: {ctx.get('content_summary', '')[:200]}…")
+        url = ctx.get('url', '')
+        norm_url = url.strip().rstrip("/").lower()
+        paper = paper_lookup.get(norm_url, {})
+        year = paper.get('publication_year')
+        year_str = f"({year})" if year else "(Unknown Year)"
+        ctx_lines.append(f"- {url} {year_str}: {ctx.get('content_summary', '')[:200]}…")
     contexts_summary = "\n".join(ctx_lines) if ctx_lines else "No contexts available."
 
     try:

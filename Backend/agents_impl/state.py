@@ -8,6 +8,9 @@ class PaperMeta(TypedDict):
     url: str
     snippet: str
     relevance_note: str   # extraction agent's one-line relevance judgement
+    publication_year: int | None
+    authors: str | None
+    citation_count: int | None
 
 
 class AgentState(TypedDict):
@@ -65,6 +68,7 @@ class EvaluationOutput(BaseModel):
     coverage_score: int = Field(ge=0, le=10, description="How well the topic is covered (0–10)")
     synthesis_score: int = Field(ge=0, le=10, description="Quality of the written report (0–10)")
     citation_score: int = Field(ge=0, le=10, description="Are all claims backed by sources (0–10)")
+    recency_score: int = Field(ge=0, le=10, description="Recency of the paper publications and references (0–10)")
     overall_score: float = Field(description="Weighted average of all scores")
     strengths: list[str] = Field(description="What the pipeline did well")
     weaknesses: list[str] = Field(description="Where it fell short")

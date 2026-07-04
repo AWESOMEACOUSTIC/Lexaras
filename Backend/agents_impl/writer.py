@@ -23,9 +23,12 @@ _WRITER_SYSTEM = textwrap.dedent("""
     3. STRUCTURE: Use clear H2 headings, bullet points for findings, and prose
        paragraphs for interpretation. The report must be readable by both a
        technical expert and an informed non-specialist.
-    4. NO FABRICATION: If the extracted contexts do not contain enough information
+    4. PRIORITISE RECENCY: Explicitly check publication years. Prioritise recent
+       findings and flag when you are citing older work. Contrast newer insights
+       against older consensus.
+    5. NO FABRICATION: If the extracted contexts do not contain enough information
        to make a claim, say so explicitly rather than filling gaps with assumptions.
-    5. TONE: Authoritative, objective, analytical. Avoid hedging language like
+    6. TONE: Authoritative, objective, analytical. Avoid hedging language like
        "it seems" or "perhaps" unless genuinely uncertain — and flag uncertainty
        explicitly when it exists.
 
@@ -85,6 +88,7 @@ def node_writer(state: AgentState) -> AgentState:
     contexts = state.get("extracted_contexts", [])
     errors = state.get("extraction_errors", [])
     topic = state["topic"]
+    papers = state.get("discovered_papers", [])
 
     logger.info("[Writer] Starting | contexts=%d | topic=%r", len(contexts), topic)
     start = time.perf_counter()
@@ -97,21 +101,39 @@ def node_writer(state: AgentState) -> AgentState:
         )
         return state
 
+    # Build a lookup for discovered papers metadata
+    paper_lookup = {p["url"].strip().rstrip("/").lower(): p for p in papers if "url" in p}
+
     # Build the contexts block for the prompt
     contexts_block_parts: list[str] = []
     for i, ctx in enumerate(contexts, start=1):
+        url = ctx.get('url', '')
+        norm_url = url.strip().rstrip("/").lower()
+        paper = paper_lookup.get(norm_url, {})
+
+        title = paper.get('title') or "Unknown Title"
+        year = paper.get('publication_year')
+        year_str = str(year) if year else "Unknown"
+        authors = paper.get('authors') or "Unknown Authors"
+        citations = paper.get('citation_count')
+        citations_str = str(citations) if citations is not None else "N/A"
+
         key_points_str = "\n".join(f"  • {kp}" for kp in ctx.get("key_points", []))
-        citations_str = "\n".join(f"  • {c}" for c in ctx.get("citations", [])[:5])
+        citations_str_list = "\n".join(f"  • {c}" for c in ctx.get("citations", [])[:5])
         part = textwrap.dedent(f"""
             --- Paper {i} ---
-            URL: {ctx.get('url', 'N/A')}
+            Title: {title}
+            URL: {url}
+            Publication Year: {year_str}
+            Authors: {authors}
+            Citation Count: {citations_str}
             SUMMARY: {ctx.get('content_summary', '')}
             METHODOLOGY: {ctx.get('methodology', 'Not specified')}
             KEY POINTS:
             {key_points_str}
             RELEVANCE TO TOPIC: {ctx.get('relevance_to_topic', '')}
             CITED WORKS:
-            {citations_str}
+            {citations_str_list}
         """).strip()
         contexts_block_parts.append(part)
 
