@@ -32,6 +32,17 @@ st.set_page_config(
 # Apply CSS styling
 load_styles()
 
+# ── Inject layout classes via JS
+st.components.v1.html("""
+<script>
+    const cols = window.parent.document.querySelectorAll('[data-testid="column"]');
+    if (cols.length >= 2) {
+        cols[0].classList.add('panel-left');
+        cols[1].classList.add('panel-right');
+    }
+</script>
+""", height=0, width=0)
+
 # ── Session state initialisation
 _DEFAULTS = {
     "results": None,       # Final AgentState dict
@@ -47,15 +58,16 @@ for k, v in _DEFAULTS.items():
 
 # ── Header
 st.markdown("""
-<div style="display:flex; align-items:baseline; gap:0; padding-bottom:1.6rem;">
-    <span class="lex-wordmark">◈ Lex<span>aras</span></span>
-    <span class="lex-tagline">research intelligence</span>
+<div class="lex-header">
+    <div style="display:flex; align-items:baseline; gap:0;">
+        <span class="lex-wordmark">◈ Lex<span class="lex-wordmark-accent">aras</span></span>
+        <span class="lex-tagline">research intelligence</span>
+    </div>
 </div>
 """, unsafe_allow_html=True)
-st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
 
 # ── Two-column split
-left, right = st.columns([5, 8], gap="large")
+left, right = st.columns([5, 8])
 
 # ── LEFT PANEL (Inputs and Controls)
 with left:
@@ -66,7 +78,17 @@ with left:
         label_visibility="collapsed",
         key="topic_field",
     )
-    st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+    
+    # Let the user choose the search mode! (Added for the config updates)
+    mode_input = st.selectbox(
+        "Search Strategy",
+        ["default", "scholar_only"],
+        format_func=lambda x: "Mixed Sources (Scholar + Web)" if x == "default" else "Google Scholar Only",
+        key="mode_field",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
     run_btn = st.button("Run Research  →", use_container_width=True)
 
     st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
@@ -86,14 +108,14 @@ with left:
         # Render empty stats placeholder
         metrics_slot.markdown("""
         <div class="metric-grid">
-            <div class="metric-pill"><div class="mp-label">Papers found</div><div class="mp-value" style="color:#2a2a40;">—</div></div>
-            <div class="metric-pill"><div class="mp-label">Extracted</div><div class="mp-value" style="color:#2a2a40;">—</div></div>
-            <div class="metric-pill"><div class="mp-label">Report words</div><div class="mp-value" style="color:#2a2a40;">—</div></div>
-            <div class="metric-pill"><div class="mp-label">Overall score</div><div class="mp-value" style="color:#2a2a40;">—</div></div>
-        </div>
-        <div class="metric-pill" style="margin-top:0.5rem;">
-            <div class="mp-label">Elapsed time</div>
-            <div class="mp-value" style="color:#2a2a40;">—</div>
+            <div class="metric-pill"><div class="mp-label">Papers found</div><div class="mp-value c-muted">—</div></div>
+            <div class="metric-pill"><div class="mp-label">Extracted</div><div class="mp-value c-muted">—</div></div>
+            <div class="metric-pill"><div class="mp-label">Report words</div><div class="mp-value c-muted">—</div></div>
+            <div class="metric-pill"><div class="mp-label">Overall score</div><div class="mp-value c-muted">—</div></div>
+            <div class="metric-pill full-width">
+                <div class="mp-label">Elapsed time</div>
+                <div class="mp-value c-muted">—</div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -123,7 +145,9 @@ with right:
                     with progress_slot.container():
                         with st.spinner(status_msg):
                             if stage_idx == len(stages_list) - 1:
-                                results = run_pipeline(topic)
+                                # We pass search mode to run_pipeline!
+                                from ui_impl.controller import run_pipeline
+                                results = run_pipeline(topic, mode_input)
                             else:
                                 time.sleep(0.3)
 
@@ -154,12 +178,14 @@ with right:
         r = st.session_state.results
         topic_label = st.session_state.topic
         errors = r.get("extraction_errors", [])
-
+        
+        # New topic heading layout
         st.markdown(f"""
-        <div style="margin-bottom:1.2rem;">
-            <div class="sec-label" style="margin-bottom:0.2rem;">Research output for</div>
-            <div style="font-size:1.15rem; font-weight:700; color:#e8e8f8;">
-                {topic_label}
+        <div class="topic-heading">
+            <div class="topic-label">Research output for</div>
+            <div class="topic-title">{topic_label}</div>
+            <div class="topic-meta">
+                <span class="info-chip">Mode: {r.get("search_mode", "default")}</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
