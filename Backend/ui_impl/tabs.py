@@ -27,9 +27,16 @@ def render_sources_tab(r: dict) -> None:
     else:
         st.markdown(f'<div class="sec-label">{len(papers)} Papers Discovered</div>', unsafe_allow_html=True)
         for p in papers:
+            source_badge = '<span class="badge badge-scholar">Scholar</span>' if p.get("source") == "scholar" else '<span class="badge badge-web">Web</span>'
+            year_badge = f'<span class="badge badge-year">{p.get("publication_year")}</span>' if p.get("publication_year") else ''
             st.markdown(f"""
             <div class="paper-card">
                 <div class="pc-title">{p.get("title","Untitled")}</div>
+                <div class="pc-meta">
+                    {source_badge}
+                    {year_badge}
+                </div>
+                <div class="pc-authors">{p.get("authors","")}</div>
                 <div class="pc-url"><a href="{p.get("url","#")}" target="_blank">{p.get("url","")}</a></div>
                 <div class="pc-note">{p.get("relevance_note","")}</div>
             </div>
@@ -43,20 +50,20 @@ def render_sources_tab(r: dict) -> None:
             key_points = ctx.get("key_points", [])
             with st.expander(f"📄  {url[:75]}{'…' if len(url) > 75 else ''}"):
                 st.markdown(f"""
-                <div style="font-size:0.82rem; color:#666688;
+                <div style="font-size:0.82rem; color:#6666a0;
                             margin-bottom:0.6rem; word-break:break-all;">
                     {url}
                 </div>
                 """, unsafe_allow_html=True)
                 if ctx.get("content_summary"):
                     st.markdown(f"""
-                    <div style="font-size:0.86rem; color:#a0a0c0;
+                    <div style="font-size:0.86rem; color:#b8b8d8;
                                 line-height:1.7; margin-bottom:0.8rem;">
                         {ctx["content_summary"]}
                     </div>
                     """, unsafe_allow_html=True)
                 if key_points:
-                    kp_items = "".join(f"<li>{kp}</li>" for kp in key_points)
+                    kp_items = "".join(f'<li><span class="kp-bullet">›</span> <div>{kp}</div></li>' for kp in key_points)
                     st.markdown(
                         f'<ul class="kp-list">{kp_items}</ul>',
                         unsafe_allow_html=True,
@@ -64,8 +71,8 @@ def render_sources_tab(r: dict) -> None:
                 if ctx.get("methodology"):
                     st.markdown(f"""
                     <div style="margin-top:0.7rem; font-size:0.8rem;
-                                color:#555578;">
-                        <strong style="color:#888899;">Methodology:</strong>
+                                color:#9090b8;">
+                        <strong style="color:#d0d0e8;">Methodology:</strong>
                         {ctx["methodology"]}
                     </div>
                     """, unsafe_allow_html=True)
@@ -84,23 +91,15 @@ def render_evaluation_tab(r: dict) -> None:
 
         # Overall score ring + verdict
         st.markdown(f"""
-        <div class="score-ring-wrap">
-            <div class="score-ring" style="
-                background: conic-gradient(
-                    {ring_color} {overall/10*360}deg,
-                    #1e1e30 0deg
-                );">
-                <div style="
-                    width:54px; height:54px; border-radius:50%;
-                    background:#111120;
-                    display:flex; align-items:center; justify-content:center;
-                    font-size:1.15rem; font-weight:700; color:{ring_color};">
+        <div class="score-hero">
+            <div class="score-ring-outer" style="background: conic-gradient({ring_color} {overall/10*360}deg, #1e1e30 0deg);">
+                <div class="score-ring-inner" style="color:{ring_color};">
                     {overall:.1f}
                 </div>
             </div>
-            <div class="score-verdict">
-                <strong>Overall Score</strong><br>
-                {verdict}
+            <div class="score-verdict-block">
+                <div class="score-label">Overall Score</div>
+                <div class="score-text">{verdict}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -115,7 +114,7 @@ def render_evaluation_tab(r: dict) -> None:
         ]
         bars_html = "".join(score_bar_html(label, val) for label, val in dims)
         st.markdown(
-            f'<div style="background:#111120; border:1px solid #1e1e30; border-radius:10px; padding:1rem 1.2rem;">{bars_html}</div>',
+            f'<div class="score-bars-wrap">{bars_html}</div>',
             unsafe_allow_html=True,
         )
 
@@ -126,7 +125,7 @@ def render_evaluation_tab(r: dict) -> None:
         with col_s:
             st.markdown('<div class="sec-label">Strengths</div>', unsafe_allow_html=True)
             items = "".join(
-                f'<li><span style="color:#22c55e;">✓</span> {s}</li>'
+                f'<li><span class="fb-icon" style="color:#4ade80;">✓</span> <div>{s}</div></li>'
                 for s in ev.get("strengths", [])
             )
             st.markdown(f'<ul class="fb-list">{items}</ul>', unsafe_allow_html=True)
@@ -134,7 +133,7 @@ def render_evaluation_tab(r: dict) -> None:
         with col_w:
             st.markdown('<div class="sec-label">Weaknesses</div>', unsafe_allow_html=True)
             items = "".join(
-                f'<li><span style="color:#ef4444;">✗</span> {w}</li>'
+                f'<li><span class="fb-icon" style="color:#f87171;">✗</span> <div>{w}</div></li>'
                 for w in ev.get("weaknesses", [])
             )
             st.markdown(f'<ul class="fb-list">{items}</ul>', unsafe_allow_html=True)
@@ -144,7 +143,7 @@ def render_evaluation_tab(r: dict) -> None:
             st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
             st.markdown('<div class="sec-label">Improvement Suggestions</div>', unsafe_allow_html=True)
             items = "".join(
-                f'<li><span style="color:#6c63ff;">→</span> {s}</li>'
+                f'<li><span class="fb-icon" style="color:#7c74ff;">→</span> <div>{s}</div></li>'
                 for s in suggestions
             )
             st.markdown(f'<ul class="fb-list">{items}</ul>', unsafe_allow_html=True)
@@ -154,11 +153,17 @@ def render_debug_tab(r: dict) -> None:
     queries = r.get("search_queries", [])
     if queries:
         for i, q in enumerate(queries, 1):
+            # Parse out source tag if encoded in query string (from old _collect_scholar_papers)
+            source_tag = ""
+            if "]" in q and "[" in q:
+                # E.g. "transformer architecture [2024]"
+                # Just render exactly what we fired.
+                pass
+
             st.markdown(f"""
-            <div style="background:#111120; border:1px solid #1e1e30;
-                        border-radius:8px; padding:0.6rem 0.9rem;
-                        margin-bottom:0.4rem; font-size:0.84rem; color:#9090b8;">
-                <span style="color:#6c63ff; font-weight:600;">Q{i}</span>  {q}
+            <div class="query-pill">
+                <div class="query-index">Q{i}</div>
+                <div>{q}</div>
             </div>
             """, unsafe_allow_html=True)
     else:
@@ -185,3 +190,4 @@ def render_debug_tab(r: dict) -> None:
     st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
     with st.expander("Raw discovery output"):
         st.text(r.get("discovery_raw", "—"))
+
