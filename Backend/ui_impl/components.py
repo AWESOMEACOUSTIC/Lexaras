@@ -22,7 +22,7 @@ def render_stages(placeholder, active: int = -1, done: int = 0, failed: bool = F
         parts.append(f"""
         <div class="stage-card {css}">
             <div class="stage-icon">{icon}</div>
-            <div class="stage-text">
+            <div>
                 <div class="s-name">{name}</div>
                 <div class="s-sub">{status if i <= active or i < done else sub}</div>
             </div>
@@ -34,10 +34,17 @@ def render_stages(placeholder, active: int = -1, done: int = 0, failed: bool = F
 
 def render_metrics(placeholder, r: dict, elapsed: float) -> None:
     papers   = len(r.get("discovered_papers", []))
+    num_scholar = len(r.get("scholar_papers", []))
+    num_web = len(r.get("web_papers", []))
     extracted = len(r.get("extracted_contexts", []))
     words    = len(r.get("draft_report", "").split())
     score    = r.get("evaluation", {}).get("overall_score", 0)
-    sc_cls   = score_css_class(float(score)) if score else "c-amber"
+    sc_cls   = score_css_class(float(score)) if score else "c-muted"
+
+    # Compute source split percentage
+    scholar_pct = (num_scholar / max(1, papers)) * 100
+    web_pct = (num_web / max(1, papers)) * 100
+
     placeholder.markdown(f"""
     <div class="metric-grid">
         <div class="metric-pill">
@@ -56,9 +63,22 @@ def render_metrics(placeholder, r: dict, elapsed: float) -> None:
             <div class="mp-label">Overall score</div>
             <div class="mp-value {sc_cls}">{score if score else "—"}</div>
         </div>
-    </div>
-    <div class="metric-pill" style="margin-top:0.5rem;">
-        <div class="mp-label">Elapsed time</div>
-        <div class="mp-value">{elapsed:.1f}s</div>
+        
+        <!-- Source split visualizer spanning full width -->
+        <div class="metric-pill full-width" style="padding-top: 1rem;">
+            <div style="display:flex; justify-content:space-between; margin-bottom: 0.5rem;">
+                <div class="source-split-label">Scholar ({num_scholar})</div>
+                <div class="source-split-label">Web ({num_web})</div>
+            </div>
+            <div class="source-split-bar">
+                <div class="source-split-fill-scholar" style="width: {scholar_pct}%;"></div>
+                <div class="source-split-fill-web" style="width: {web_pct}%;"></div>
+            </div>
+        </div>
+
+        <div class="metric-pill full-width" style="margin-top:0.2rem;">
+            <div class="mp-label">Elapsed time</div>
+            <div class="mp-value c-muted">{elapsed:.1f}s</div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
