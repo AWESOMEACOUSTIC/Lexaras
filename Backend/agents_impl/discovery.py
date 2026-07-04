@@ -1,239 +1,398 @@
 import json
 import logging
+import textwrap
 import time
-import datetime
-from langchain_core.messages import HumanMessage, SystemMessage
+from typing import Optional
 
-from agents_impl.state import AgentState
+from langchain_core.messages import HumanMessage
+from agents_impl.state import AgentState, PaperMeta
 from agents_impl.llm import llm
 from config import settings
-from tools_impl.scholar_search import execute_scholar_search_raw
-from tools_impl.web_search import execute_web_search_raw
+from tools import (
+    scholar_search,
+    web_search,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+
+def _strip_fences(raw: str) -> str:
+    """Remove markdown code fences that Mistral sometimes wraps JSON in."""
+    return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
+def _deduplicate_papers(papers: list[PaperMeta]) -> list[PaperMeta]:
+    """
+    Remove duplicates by URL, preserving insertion order.
+    Scholar result takes precedence over web result if the same URL appears in both.
+    """
+    seen: set[str] = set()
+    out:  list[PaperMeta] = []
+    for p in papers:
+        url = p.get("url", "").strip().rstrip("/")
+        if url and url not in seen:
+            seen.add(url)
+            out.append(p)
+    return out
+
+
+def _sort_by_year(papers: list[PaperMeta]) -> list[PaperMeta]:
+    """
+    Sort papers newest-first. Papers with no publication_year sink to the bottom
+    rather than crashing the sort.
+    """
+    return sorted(
+        papers,
+        key=lambda p: p.get("publication_year") or 0,
+        reverse=True,
+    )
+
+
+def _parse_tool_output_to_papers(
+    raw_output: str,
+    source: str,
+) -> list[PaperMeta]:
+    """
+    Parse the structured text envelope that web_search and scholar_search return
+    into a list of PaperMeta dicts.
+    """
+    import re
+
+    papers: list[PaperMeta] = []
+    blocks = re.split(r"\n-{20,}\n", raw_output)
+
+    for block in blocks:
+        block = block.strip()
+        if not block or block.startswith("GOOGLE SCHOLAR") or block.startswith("WEB SEARCH"):
+            continue
+
+        title_match = re.search(r"^\[?\d+\]?\s*(.+)$", block, re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else "Untitled"
+
+        url_match = re.search(r"URL\s*:\s*(\S+)", block)
+        url = url_match.group(1).strip() if url_match else ""
+
+        year_match = re.search(r"Year\s*:\s*(\d{4})", block)
+        pub_year = int(year_match.group(1)) if year_match else None
+
+        authors_match = re.search(r"Authors\s*:\s*(.+)$", block, re.MULTILINE)
+        authors = authors_match.group(1).strip() if authors_match else None
+        if authors and authors.lower() in ("unknown", "n/a", ""):
+            authors = None
+
+        snippet_match = re.search(r"Snippet\s*:\s*(.+?)(?=\n\S|\Z)", block, re.DOTALL)
+        snippet = snippet_match.group(1).strip() if snippet_match else ""
+
+        if not url:
+            continue
+
+        papers.append(PaperMeta(
+            title=title,
+            url=url,
+            snippet=snippet,
+            relevance_note="",
+            source=source,
+            publication_year=pub_year,
+            authors=authors,
+        ))
+
+    return papers
+
+
+def _score_relevance_notes(
+    papers: list[PaperMeta],
+    topic: str,
+) -> list[PaperMeta]:
+    """
+    Ask the LLM to write a one-sentence relevance_note for each paper.
+    Batched into a single call to keep token usage minimal.
+    """
+    if not papers:
+        return papers
+
+    paper_list = "\n".join(
+        f"{i}. Title: {p['title']}\n   Snippet: {p['snippet'][:200]}"
+        for i, p in enumerate(papers, 1)
+    )
+
+    prompt = textwrap.dedent(f"""
+        Research topic: {topic}
+
+        For each paper below, write a single sentence explaining why it is or is not
+        relevant to the research topic. Be specific. If it is not relevant, say so.
+
+        Papers:
+        {paper_list}
+
+        Respond ONLY with valid JSON — a list of objects in the same order:
+        [
+            {{"index": 1, "relevance_note": "..."}},
+            {{"index": 2, "relevance_note": "..."}}
+        ]
+    """).strip()
+
+    try:
+        raw = llm.invoke([HumanMessage(content=prompt)]).content
+        notes: list[dict] = json.loads(_strip_fences(raw))
+        note_map = {item["index"]: item["relevance_note"] for item in notes}
+        for i, p in enumerate(papers, 1):
+            p["relevance_note"] = note_map.get(i, "Relevance assessment unavailable.")
+    except Exception as exc:
+        logger.warning("[Discovery] relevance scoring failed: %s", exc)
+        for p in papers:
+            if not p.get("relevance_note"):
+                p["relevance_note"] = "Relevance assessment unavailable."
+
+    return papers
+
+
+# ── QUERY GENERATION ──────────────────────────────────────────────────────────
+
+_QUERY_GEN_PROMPT = textwrap.dedent("""
+    You are a senior research librarian generating precise academic search queries.
+
+    Research topic: {topic}
+    Search mode: {search_mode}
+    Retry attempt: {retry_count} (0 = first attempt)
+
+    Generate {num_queries} distinct search queries that together cover the topic from
+    complementary angles:
+        - Core terminology / primary concept
+        - Empirical studies / experimental results
+        - Recent advances / state of the art (use terms like "2023 2024 2025")
+        - Key authors or landmark papers (if you know them)
+
+    If retry_count > 0, the previous queries returned too few results.
+    Broaden the queries: use synonyms, parent concepts, or adjacent fields.
+
+    Respond ONLY with valid JSON — a flat list of strings:
+    ["query one", "query two", "query three"]
+""").strip()
+
+
+def _generate_queries(topic: str, search_mode: str, retry_count: int) -> list[str]:
+    """
+    Ask the LLM to generate 2-4 diverse search queries for the topic.
+    Returns a list of query strings.
+    """
+    num_queries = 3 if retry_count == 0 else 4
+
+    prompt = _QUERY_GEN_PROMPT.format(
+        topic=topic,
+        search_mode=search_mode,
+        retry_count=retry_count,
+        num_queries=num_queries,
+    )
+    try:
+        raw    = llm.invoke([HumanMessage(content=prompt)]).content
+        queries: list[str] = json.loads(_strip_fences(raw))
+        if not isinstance(queries, list) or not queries:
+            raise ValueError("LLM returned empty or non-list queries")
+        return [str(q).strip() for q in queries if str(q).strip()]
+    except Exception as exc:
+        logger.warning("[Discovery] query generation failed (%s), using topic as fallback", exc)
+        return [topic]
+
+
+# ── COLLECTION LOOPS ─────────────────────────────────────────────────────────
+
+def _collect_scholar_papers(
+    queries: list[str],
+    year_from: int,
+    year_to: int,
+    quota: int,
+) -> tuple[list[PaperMeta], list[str], str]:
+    """
+    Year-descending Scholar collection loop.
+    """
+    papers:       list[PaperMeta] = []
+    queries_fired: list[str]      = []
+    raw_parts:    list[str]       = []
+
+    for query in queries:
+        if len(papers) >= quota:
+            break
+
+        for year in range(year_to, year_from - 1, -1):
+            remaining = quota - len(papers)
+            if remaining <= 0:
+                break
+
+            queries_fired.append(f"{query} [{year}]")
+            logger.info(
+                "[Discovery] Scholar search | query=%r | year=%d | need=%d",
+                query, year, remaining,
+            )
+
+            try:
+                raw = scholar_search.invoke({
+                    "query":       query,
+                    "year_from":   year,
+                    "year_to":     year,
+                    "max_results": min(remaining + 2, 10),
+                })
+                raw_parts.append(raw)
+
+                if any(tag in raw for tag in (
+                    "[SCHOLAR_ERROR]", "[NO_SCHOLAR_RESULTS]",
+                    "[SCHOLAR_HTTP_ERROR]", "[SCHOLAR_QUOTA_EXCEEDED]",
+                    "[SCHOLAR_NETWORK_ERROR]", "[NO_USABLE_SCHOLAR_RESULTS]",
+                )):
+                    logger.warning(
+                        "[Discovery] Scholar returned error for query=%r year=%d",
+                        query, year,
+                    )
+                    continue
+
+                batch = _parse_tool_output_to_papers(raw, source="scholar")
+                papers.extend(batch)
+                logger.info(
+                    "[Discovery] Scholar window done | year=%d | batch=%d | total=%d",
+                    year, len(batch), len(papers),
+                )
+
+            except Exception as exc:
+                logger.error(
+                    "[Discovery] Scholar call failed | query=%r | year=%d | %s",
+                    query, year, exc,
+                )
+
+    return papers, queries_fired, "\n\n".join(raw_parts)
+
+
+def _collect_web_papers(
+    queries: list[str],
+    quota: int,
+) -> tuple[list[PaperMeta], list[str], str]:
+    """
+    Tavily web search fill — runs until quota is met or all queries exhausted.
+    """
+    papers:        list[PaperMeta] = []
+    queries_fired: list[str]       = []
+    raw_parts:     list[str]       = []
+
+    for query in queries:
+        if len(papers) >= quota:
+            break
+
+        remaining = quota - len(papers)
+        queries_fired.append(query)
+        logger.info(
+            "[Discovery] Web search | query=%r | need=%d", query, remaining,
+        )
+
+        try:
+            raw = web_search.invoke({
+                "query":       query,
+                "max_results": min(remaining + 2, 10),
+            })
+            raw_parts.append(raw)
+
+            if any(tag in raw for tag in ("[SEARCH_ERROR]", "[NO_RESULTS]")):
+                logger.warning("[Discovery] Web search returned error for query=%r", query)
+                continue
+
+            batch = _parse_tool_output_to_papers(raw, source="web")
+            papers.extend(batch)
+            logger.info(
+                "[Discovery] Web batch done | query=%r | batch=%d | total=%d",
+                query, len(batch), len(papers),
+            )
+
+        except Exception as exc:
+            logger.error("[Discovery] Web call failed | query=%r | %s", query, exc)
+
+    return papers, queries_fired, "\n\n".join(raw_parts)
+
+
+# ── NODE ENTRY ────────────────────────────────────────────────────────────────
+
 def node_discovery(state: AgentState) -> AgentState:
     """
-    Discovery node: Refactored to implement structured query generation and a
-    deterministic year-descending search loop matching the search_mode.
+    Discovery node — orchestrates the full paper collection strategy.
     """
-    topic = state["topic"]
-    retries = state.get("retry_count", 0)
-    logger.info("[Discovery] Starting | topic=%r | retry=%d", topic, retries)
+    topic       = state["topic"]
+    mode        = state["search_mode"]
+    year_from   = state["year_from"]
+    year_to     = state["year_to"]
+    retry_count = state.get("retry_count", 0)
+
+    academic_quota = settings.ACADEMIC_QUOTA
+    total_quota    = settings.TOTAL_PAPER_QUOTA
+
+    logger.info(
+        "[Discovery] Starting | topic=%r | mode=%s | years=%d-%d | retry=%d",
+        topic, mode, year_from, year_to, retry_count,
+    )
     start = time.perf_counter()
 
-    # Step 1: Generate distinct, complementary search queries using the LLM
-    query_system = (
-        "You are Lexaras Discovery — a specialised academic research intelligence agent.\n"
-        "Your sole responsibility is to generate 2 to 4 distinct, complementary search queries that together "
-        "cover the research topic from different angles (theoretical, empirical, recent advances, key authors).\n"
-        "Do NOT include year constraints in the queries. Return ONLY a valid JSON object matching the schema:\n"
-        "{\n"
-        '    "search_queries": ["query 1", "query 2", ...]\n'
-        "}\n"
-        "No preamble, no markdown code fences, just plain JSON."
+    all_queries:   list[str] = []
+    all_raw_parts: list[str] = []
+
+    # 1. Generate queries
+    queries = _generate_queries(topic, mode, retry_count)
+    all_queries.extend(queries)
+    logger.info("[Discovery] Generated %d queries: %s", len(queries), queries)
+
+    # 2. Google Scholar — year-descending
+    scholar_quota = total_quota if mode == "scholar_only" else academic_quota
+
+    scholar_papers_raw, sq_fired, scholar_raw = _collect_scholar_papers(
+        queries=queries,
+        year_from=year_from,
+        year_to=year_to,
+        quota=scholar_quota,
     )
-    
-    query_human = (
-        f"Research Topic: {topic}\n"
-        f"Previous retry count: {retries}\n\n"
-        "Generate 2-4 search queries to find the most relevant papers. "
-        "If retry count is > 0, make the queries broader to expand search coverage."
-    )
+    all_queries.extend(sq_fired)
+    all_raw_parts.append(scholar_raw)
 
-    try:
-        query_response = llm.invoke([
-            SystemMessage(content=query_system),
-            HumanMessage(content=query_human)
-        ])
-        raw_queries = query_response.content.strip()
-        cleaned_queries = raw_queries.removeprefix("```json").removesuffix("```").strip()
-        parsed_queries = json.loads(cleaned_queries)
-        queries = parsed_queries.get("search_queries", [topic])
-    except Exception as exc:
-        logger.warning("[Discovery] Failed to generate structured queries, falling back to topic query: %s", exc)
-        queries = [topic]
-
-    state["search_queries"] = queries
-    logger.info("[Discovery] Generated search queries: %r", queries)
-
-    # Step 2: Set up loop parameters
-    current_year = datetime.date.today().year
-    search_mode = settings.SEARCH_MODE
-    academic_quota = settings.ACADEMIC_QUOTA
-    total_quota = settings.TOTAL_PAPER_QUOTA
-    scholar_years = settings.SCHOLAR_YEARS
-
-    collected_papers = []
-    seen_urls = set()
-    raw_logs = []
-
-    # Step 3: Run search loop based on search_mode
-    if search_mode == "scholar_only":
-        logger.info("[Discovery] Running in scholar_only mode (quota: %d)", total_quota)
-        # Year-descending Scholar-only loop
-        for year in range(current_year, current_year - scholar_years - 1, -1):
-            if len(collected_papers) >= total_quota:
-                break
-            for q in queries:
-                if len(collected_papers) >= total_quota:
-                    break
-                logger.info("[Discovery] Scholar Search | Query: %r | Year: %d", q, year)
-                try:
-                    papers = execute_scholar_search_raw(
-                        query=q,
-                        year_from=year,
-                        year_to=year,
-                        max_results=5,
-                    )
-                    raw_logs.append(f"Scholar search for '{q}' in {year} found {len(papers)} papers.")
-                    for p in papers:
-                        url = p["url"]
-                        norm_url = url.strip().rstrip("/").lower()
-                        if norm_url not in seen_urls:
-                            seen_urls.add(norm_url)
-                            collected_papers.append(p)
-                            if len(collected_papers) >= total_quota:
-                                break
-                except Exception as e:
-                    err_msg = f"Scholar search failed for query '{q}' in {year}: {e}"
-                    logger.warning("[Discovery] %s", err_msg)
-                    state["error_log"] = state.get("error_log", []) + [err_msg]
-
-    else:
-        # Default mode: collect academic_quota from Google Scholar first, then fill remainder with web search
-        logger.info(
-            "[Discovery] Running in default mode (scholar quota: %d, total quota: %d)",
-            academic_quota, total_quota,
-        )
-        # Academic portion
-        for year in range(current_year, current_year - scholar_years - 1, -1):
-            if len(collected_papers) >= academic_quota:
-                break
-            for q in queries:
-                if len(collected_papers) >= academic_quota:
-                    break
-                logger.info("[Discovery] Scholar Search | Query: %r | Year: %d", q, year)
-                try:
-                    papers = execute_scholar_search_raw(
-                        query=q,
-                        year_from=year,
-                        year_to=year,
-                        max_results=5,
-                    )
-                    raw_logs.append(f"Scholar search for '{q}' in {year} found {len(papers)} papers.")
-                    for p in papers:
-                        url = p["url"]
-                        norm_url = url.strip().rstrip("/").lower()
-                        if norm_url not in seen_urls:
-                            seen_urls.add(norm_url)
-                            collected_papers.append(p)
-                            if len(collected_papers) >= academic_quota:
-                                break
-                except Exception as e:
-                    err_msg = f"Scholar search failed for query '{q}' in {year}: {e}"
-                    logger.warning("[Discovery] %s", err_msg)
-                    state["error_log"] = state.get("error_log", []) + [err_msg]
-
-        # Web fill portion
-        remainder_quota = total_quota - len(collected_papers)
-        if remainder_quota > 0:
-            logger.info("[Discovery] Filling remaining %d slot(s) with Web Search", remainder_quota)
-            for q in queries:
-                if len(collected_papers) >= total_quota:
-                    break
-                logger.info("[Discovery] Web Search | Query: %r", q)
-                try:
-                    results = execute_web_search_raw(query=q, max_results=5)
-                    raw_logs.append(f"Web search for '{q}' found {len(results)} results.")
-                    for p in results:
-                        url = p["url"]
-                        norm_url = url.strip().rstrip("/").lower()
-                        if norm_url not in seen_urls:
-                            seen_urls.add(norm_url)
-                            collected_papers.append(p)
-                            if len(collected_papers) >= total_quota:
-                                break
-                except Exception as e:
-                    err_msg = f"Web search failed for query '{q}': {e}"
-                    logger.warning("[Discovery] %s", err_msg)
-                    state["error_log"] = state.get("error_log", []) + [err_msg]
-
-    state["discovery_raw"] = "\n".join(raw_logs)
-
-    # Step 4: Call LLM to generate one-sentence relevance notes for the final selected papers
-    if not collected_papers:
-        logger.warning("[Discovery] No papers collected.")
-        state["discovered_papers"] = []
-        return state
-
-    papers_summary_parts = []
-    for i, p in enumerate(collected_papers, start=1):
-        summary_part = (
-            f"Paper [{i}]:\n"
-            f"  Title: {p['title']}\n"
-            f"  URL: {p['url']}\n"
-            f"  Snippet: {p['snippet']}\n"
-        )
-        papers_summary_parts.append(summary_part)
-    papers_block = "\n".join(papers_summary_parts)
-
-    relevance_system = (
-        "You are Lexaras Discovery — a specialised academic research intelligence agent.\n"
-        "Your job is to read the research topic and the list of candidate papers, and write a "
-        "one-sentence relevance note for each paper explaining why it matters for this topic.\n"
-        "Return ONLY a valid JSON object matching the schema:\n"
-        "{\n"
-        '    "relevance_notes": [\n'
-        '        {"url": "...", "relevance_note": "..."},\n'
-        "        ...\n"
-        "    ]\n"
-        "}\n"
-        "No preamble, no markdown formatting."
-    )
-
-    relevance_human = (
-        f"Research Topic: {topic}\n\n"
-        "Candidate Papers:\n"
-        f"{papers_block}\n\n"
-        "Generate a one-sentence relevance note for each paper."
-    )
-
-    notes_by_url = {}
-    try:
-        relevance_response = llm.invoke([
-            SystemMessage(content=relevance_system),
-            HumanMessage(content=relevance_human)
-        ])
-        raw_notes = relevance_response.content.strip()
-        cleaned_notes = raw_notes.removeprefix("```json").removesuffix("```").strip()
-        parsed_notes = json.loads(cleaned_notes)
-        for entry in parsed_notes.get("relevance_notes", []):
-            url_key = entry.get("url", "").strip().rstrip("/").lower()
-            if url_key:
-                notes_by_url[url_key] = entry.get("relevance_note", "")
-    except Exception as exc:
-        logger.warning("[Discovery] Failed to generate relevance notes: %s", exc)
-
-    final_papers = []
-    for p in collected_papers:
-        url_key = p["url"].strip().rstrip("/").lower()
-        fallback_note = f"Relevant academic reference discussing fields related to the topic: {topic}."
-        final_papers.append({
-            "title": p["title"],
-            "url": p["url"],
-            "snippet": p["snippet"],
-            "relevance_note": notes_by_url.get(url_key) or fallback_note,
-            "publication_year": p["publication_year"],
-            "authors": p["authors"],
-            "citation_count": p["citation_count"],
-        })
-
-    state["discovered_papers"] = final_papers
+    scholar_papers = _sort_by_year(_deduplicate_papers(scholar_papers_raw))
     logger.info(
-        "[Discovery] Complete | papers_found=%d | elapsed=%.2fs",
-        len(final_papers),
-        time.perf_counter() - start,
+        "[Discovery] Scholar collection done | unique=%d | quota=%d",
+        len(scholar_papers), scholar_quota,
+    )
+
+    # 3. Tavily web fill (default mode only)
+    web_papers: list[PaperMeta] = []
+    if mode == "default":
+        web_quota = total_quota - len(scholar_papers)
+        if web_quota > 0:
+            web_papers_raw, wq_fired, web_raw = _collect_web_papers(
+                queries=queries,
+                quota=web_quota,
+            )
+            all_queries.extend(wq_fired)
+            all_raw_parts.append(web_raw)
+            web_papers = _deduplicate_papers(web_papers_raw)
+            logger.info(
+                "[Discovery] Web fill done | unique=%d | quota=%d",
+                len(web_papers), web_quota,
+            )
+        else:
+            logger.info("[Discovery] Scholar quota met — skipping web fill.")
+
+    # 4. Combine, deduplicate, sort
+    combined = _deduplicate_papers(scholar_papers + web_papers)
+    combined = _sort_by_year(combined)
+    logger.info(
+        "[Discovery] Combined pool | scholar=%d | web=%d | total=%d",
+        len(scholar_papers), len(web_papers), len(combined),
+    )
+
+    # 5. LLM relevance scoring (batched)
+    combined = _score_relevance_notes(combined, topic)
+
+    # 6. Write to state
+    state["scholar_papers"]    = scholar_papers
+    state["web_papers"]        = web_papers
+    state["discovered_papers"] = combined
+    state["search_queries"]    = list(dict.fromkeys(all_queries))
+    state["discovery_raw"]     = "\n\n".join(all_raw_parts)
+
+    logger.info(
+        "[Discovery] Complete | papers=%d | elapsed=%.2fs",
+        len(combined), time.perf_counter() - start,
     )
     return state

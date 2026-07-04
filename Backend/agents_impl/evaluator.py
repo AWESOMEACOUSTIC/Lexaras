@@ -11,43 +11,47 @@ from agents_impl.llm import llm
 
 logger = logging.getLogger(__name__)
 
+
+def _strip_fences(raw: str) -> str:
+    """Remove markdown code fences that Mistral sometimes wraps JSON in."""
+    return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
 _EVALUATOR_SYSTEM = textwrap.dedent("""
-    You are Lexaras Evaluator — a rigorous quality assurance engine for AI-generated
-    research pipelines. Your role is to assess the entire pipeline output — from
-    paper discovery through to the final report — and produce an actionable,
-    quantitative quality score.
+    You are Lexaras Evaluator — a rigorous quality assurance engine.
+    You assess the entire pipeline output and produce an actionable quality score.
 
-    You are impartial, thorough, and do not inflate scores. A score of 8+ means
-    genuinely excellent work. A score of 5 means acceptable but improvable.
-    A score below 4 means the output has significant problems.
+    You are impartial and do not inflate scores:
+        8+ = genuinely excellent    5 = acceptable    below 4 = significant problems
 
-    EVALUATION DIMENSIONS:
-    1. Relevance (0–10): Are the discovered and extracted papers genuinely relevant
-       to the stated topic? Are off-topic papers included?
-    2. Coverage (0–10): Does the report address the topic comprehensively, or are
-       important sub-topics or perspectives missing?
-    3. Synthesis Quality (0–10): Does the writer synthesise ideas across papers,
-       or merely summarise each one individually? Are there insightful connections?
-    4. Citation Integrity (0–10): Is every claim backed by a traceable source?
-       Are URLs valid and present? Is there any content that appears fabricated?
-    5. Recency (0–10): Are the referenced papers and sources recent? Are they primarily
-       newer publications from the last 5 years? Flag if the report relies heavily on
-       outdated studies when newer work is available.
+    EVALUATION DIMENSIONS (each 0-10):
+    1. Relevance      — Are papers genuinely on-topic? Penalise off-topic results.
+    2. Coverage       — Is the topic comprehensively addressed across sub-topics?
+    3. Synthesis      — Does the report find connections across papers, or just list?
+    4. Citation       — Is every claim backed by a traceable source with a URL?
+    5. Recency        — Are papers recent? Penalise if most are older than 3 years.
+                        Google Scholar papers with year metadata are weighted higher.
+
+    OVERALL SCORE formula:
+        overall = relevance*0.25 + coverage*0.20 + synthesis*0.25 + citation*0.15 + recency*0.15
 
     OUTPUT CONSTRAINTS:
     - Return ONLY valid JSON. No preamble, no markdown fences.
-    - overall_score = (relevance*0.25 + coverage*0.2 + synthesis*0.25 + citation*0.15 + recency*0.15)
-    - improvement_suggestions must be specific and actionable, not vague.
+    - improvement_suggestions must be specific, actionable, not vague.
+    - recency_score should penalise heavily if most papers are 4+ years old.
 """).strip()
 
 _EVALUATOR_HUMAN = textwrap.dedent("""
-    Research Topic: {topic}
+    Research Topic  : {topic}
+    Search Mode     : {search_mode}
+    Year Range      : {year_from}–{year_to}
 
     === PIPELINE SUMMARY ===
-    Papers Discovered: {num_discovered}
-    Papers Successfully Extracted: {num_extracted}
-    Extraction Errors: {num_errors}
-    Error Details: {errors_summary}
+    Papers Discovered  : {num_discovered}  (Scholar: {num_scholar} | Web: {num_web})
+    Papers Extracted   : {num_extracted}
+    Extraction Errors  : {num_errors}
+    Error Details      : {errors_summary}
+    Year Distribution  : {year_distribution}
 
     === DRAFTED REPORT ===
     {draft_report}
@@ -55,7 +59,7 @@ _EVALUATOR_HUMAN = textwrap.dedent("""
     === EXTRACTED CONTEXTS (for fact-checking) ===
     {contexts_summary}
 
-    Please evaluate the pipeline output. Return your assessment in this exact JSON format:
+    Return your assessment in this exact JSON format:
     {{
         "relevance_score": <0-10>,
         "coverage_score": <0-10>,
@@ -72,57 +76,80 @@ _EVALUATOR_HUMAN = textwrap.dedent("""
 
 _evaluator_prompt = ChatPromptTemplate.from_messages([
     ("system", _EVALUATOR_SYSTEM),
-    ("human", _EVALUATOR_HUMAN),
+    ("human",  _EVALUATOR_HUMAN),
 ])
-
 _evaluator_chain = _evaluator_prompt | llm | StrOutputParser()
 
 
 def node_evaluator(state: AgentState) -> AgentState:
     """
-    Evaluator node: scores the entire pipeline output and provides feedback.
+    Evaluator node — scores the pipeline output including the new recency dimension.
+    Passes year distribution stats so the evaluator can penalise stale paper sets.
     """
-    topic = state["topic"]
-    draft = state.get("draft_report", "")
-    contexts = state.get("extracted_contexts", [])
-    errors = state.get("extraction_errors", [])
-    papers = state.get("discovered_papers", [])
+    topic     = state["topic"]
+    mode      = state["search_mode"]
+    year_from = state["year_from"]
+    year_to   = state["year_to"]
+    draft     = state.get("draft_report", "")
+    contexts  = state.get("extracted_contexts",  [])
+    errors    = state.get("extraction_errors",   [])
+    papers    = state.get("discovered_papers",   [])
 
-    logger.info("[Evaluator] Starting | topic=%r", topic)
-    start = time.perf_counter()
+    num_scholar = sum(1 for p in papers if p.get("source") == "scholar")
+    num_web     = len(papers) - num_scholar
 
-    # Build a lookup for discovered papers metadata
-    paper_lookup = {p["url"].strip().rstrip("/").lower(): p for p in papers if "url" in p}
+    # Build year distribution string for the evaluator
+    years = [
+        c.get("publication_year") for c in contexts
+        if c.get("publication_year")
+    ]
+    if years:
+        from collections import Counter
+        year_counts  = Counter(years)
+        year_dist_str = ", ".join(
+            f"{yr}: {cnt}" for yr, cnt in sorted(year_counts.items(), reverse=True)
+        )
+    else:
+        year_dist_str = "No year data available"
 
-    # Build a compact contexts summary for the evaluator prompt
     ctx_lines: list[str] = []
-    for ctx in contexts[:5]:   # cap at 5 to stay within token budget
-        url = ctx.get('url', '')
-        norm_url = url.strip().rstrip("/").lower()
-        paper = paper_lookup.get(norm_url, {})
-        year = paper.get('publication_year')
-        year_str = f"({year})" if year else "(Unknown Year)"
-        ctx_lines.append(f"- {url} {year_str}: {ctx.get('content_summary', '')[:200]}…")
+    for ctx in contexts[:6]:
+        year_s = str(ctx.get("publication_year", "?"))
+        src_s  = ctx.get("source", "?").upper()
+        ctx_lines.append(
+            f"- [{src_s} {year_s}] {ctx.get('url','N/A')}: "
+            f"{ctx.get('content_summary','')[:200]}…"
+        )
     contexts_summary = "\n".join(ctx_lines) if ctx_lines else "No contexts available."
+
+    logger.info("[Evaluator] Starting | topic=%r | mode=%s", topic, mode)
+    start = time.perf_counter()
 
     try:
         raw = _evaluator_chain.invoke({
-            "topic": topic,
-            "num_discovered": len(papers),
-            "num_extracted": len(contexts),
-            "num_errors": len(errors),
-            "errors_summary": "; ".join(errors[:3]) if errors else "None",
-            "draft_report": draft[:3000],   # truncate to avoid prompt overflow
+            "topic":            topic,
+            "search_mode":      mode,
+            "year_from":        year_from,
+            "year_to":          year_to,
+            "num_discovered":   len(papers),
+            "num_scholar":      num_scholar,
+            "num_web":          num_web,
+            "num_extracted":    len(contexts),
+            "num_errors":       len(errors),
+            "errors_summary":   "; ".join(errors[:3]) if errors else "None",
+            "year_distribution": year_dist_str,
+            "draft_report":     draft[:3000],
             "contexts_summary": contexts_summary,
         })
 
-        cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-        evaluation: dict = json.loads(cleaned)
+        cleaned    = _strip_fences(raw)
+        evaluation = json.loads(cleaned)
         state["evaluation"] = evaluation
 
         logger.info(
-            "[Evaluator] Complete | overall_score=%.1f | elapsed=%.2fs",
+            "[Evaluator] Complete | overall=%.1f | recency=%s | elapsed=%.2fs",
             evaluation.get("overall_score", 0),
+            evaluation.get("recency_score", "?"),
             time.perf_counter() - start,
         )
 
@@ -130,16 +157,14 @@ def node_evaluator(state: AgentState) -> AgentState:
         msg = f"[Evaluator] JSON parse error: {exc}"
         logger.error(msg)
         state["evaluation"] = {
-            "error": msg,
-            "overall_score": 0,
+            "error": msg, "overall_score": 0,
             "verdict": "Evaluation failed — could not parse LLM response.",
         }
     except Exception as exc:
         msg = f"[Evaluator] Unexpected error: {exc}"
         logger.error(msg, exc_info=True)
         state["evaluation"] = {
-            "error": msg,
-            "overall_score": 0,
+            "error": msg, "overall_score": 0,
             "verdict": "Evaluation failed due to an unexpected error.",
         }
 

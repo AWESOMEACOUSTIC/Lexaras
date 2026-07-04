@@ -17,80 +17,94 @@ _WRITER_SYSTEM = textwrap.dedent("""
 
     WRITING STANDARDS:
     1. ACCURACY FIRST: Every claim must be traceable to a specific source paper.
-       Use inline citations in the format [Author/Title, URL] after each claim.
+       Use inline citations in the format [Authors (Year), URL] after each claim.
+       For Scholar papers, include the publication year and authors.
     2. SYNTHESIS OVER SUMMARY: Do not just list what each paper says. Find the
        common threads, contrasts, and cumulative story they tell together.
-    3. STRUCTURE: Use clear H2 headings, bullet points for findings, and prose
-       paragraphs for interpretation. The report must be readable by both a
-       technical expert and an informed non-specialist.
-    4. PRIORITISE RECENCY: Explicitly check publication years. Prioritise recent
-       findings and flag when you are citing older work. Contrast newer insights
-       against older consensus.
-    5. NO FABRICATION: If the extracted contexts do not contain enough information
-       to make a claim, say so explicitly rather than filling gaps with assumptions.
-    6. TONE: Authoritative, objective, analytical. Avoid hedging language like
-       "it seems" or "perhaps" unless genuinely uncertain — and flag uncertainty
-       explicitly when it exists.
+    3. RECENCY AWARENESS: Highlight where recent papers (last 1-2 years) confirm,
+       challenge, or extend older findings. If the most recent papers are from
+       Google Scholar, note that they are peer-reviewed.
+    4. STRUCTURE: Use clear H2 headings, bullet points for findings, and prose
+       paragraphs for interpretation. Readable by both expert and non-specialist.
+    5. NO FABRICATION: If extracted contexts do not contain enough information
+       to make a claim, say so explicitly. Never fill gaps with assumptions.
+    6. TONE: Authoritative, objective, analytical. Flag uncertainty explicitly.
 
-    The report will be delivered to a real client. Quality and accuracy matter
-    more than length.
+    This report will be delivered to a real client. Quality and accuracy matter.
 """).strip()
 
 _WRITER_HUMAN = textwrap.dedent("""
-    Research Topic: {topic}
+    Research Topic : {topic}
+    Search Mode    : {search_mode}
+    Year Range     : {year_from} – {year_to}
+    Scholar Papers : {num_scholar}
+    Web Papers     : {num_web}
 
     Extracted Paper Contexts:
     {contexts_block}
 
-    Papers that failed to extract (note these limitations):
+    Papers that failed to extract (note limitations):
     {errors_block}
 
     Write a comprehensive research report structured as:
 
     ## Introduction
-    (150–200 words: frame the topic, why it matters, what this report covers)
+    (150-200 words: frame the topic, why it matters, what this report covers,
+     and note the search strategy — e.g. "X of Y papers are peer-reviewed
+     Google Scholar results from {year_from}–{year_to}")
 
     ## Papers Analysed
-    (Brief list: title, URL, one sentence on why it was selected)
+    (For each paper: title, authors (year), URL, one sentence on why selected,
+     and whether it is a peer-reviewed Scholar result or a web source)
 
     ## Key Findings
     (Minimum 6 detailed findings synthesised across all papers. Each finding:
-     - A bold heading capturing the insight
-     - 2–4 sentences explaining the finding with evidence
-     - Inline citation: [Paper Title, URL])
+     - Bold heading capturing the core insight
+     - 2-4 sentences with evidence and quantitative detail where available
+     - Inline citation: [Authors (Year), URL])
 
     ## Synthesis & Implications
-    (200–300 words: What does the combined body of research tell us?
-     What are the open questions? What should practitioners or researchers do next?)
+    (200-300 words: What does the combined body of research tell us?
+     What changed recently vs older findings? What are the open questions?
+     What should practitioners or researchers do next?)
 
     ## Limitations of This Report
-    (Any gaps, failed extractions, or topic areas not covered)
+    (Gaps, failed extractions, paywalled papers, topic areas not covered,
+     and any caveats about source diversity)
 
     ## Sources
-    (Numbered list of all URLs used)
+    (Numbered list: [N] Authors (Year). Title. URL. [Scholar/Web])
 
     Be rigorous, cite everything, and do not pad with filler content.
 """).strip()
 
 _writer_prompt = ChatPromptTemplate.from_messages([
     ("system", _WRITER_SYSTEM),
-    ("human", _WRITER_HUMAN),
+    ("human",  _WRITER_HUMAN),
 ])
-
 _writer_chain = _writer_prompt | creative_llm | StrOutputParser()
 
 
 def node_writer(state: AgentState) -> AgentState:
     """
-    Writer node: synthesises all extracted contexts into a final report.
-    Uses an LCEL chain (no tools needed — pure text generation).
+    Writer node — synthesises all extracted contexts into the final report.
+    Passes Scholar vs web paper counts and year range to the prompt so the
+    writer can explicitly discuss the source mix and recency profile.
     """
     contexts = state.get("extracted_contexts", [])
-    errors = state.get("extraction_errors", [])
-    topic = state["topic"]
-    papers = state.get("discovered_papers", [])
+    errors   = state.get("extraction_errors",  [])
+    topic    = state["topic"]
+    mode     = state["search_mode"]
+    year_from = state["year_from"]
+    year_to   = state["year_to"]
 
-    logger.info("[Writer] Starting | contexts=%d | topic=%r", len(contexts), topic)
+    num_scholar = sum(1 for c in contexts if c.get("source") == "scholar")
+    num_web     = len(contexts) - num_scholar
+
+    logger.info(
+        "[Writer] Starting | contexts=%d (scholar=%d web=%d) | topic=%r",
+        len(contexts), num_scholar, num_web, topic,
+    )
     start = time.perf_counter()
 
     if not contexts:
@@ -101,61 +115,50 @@ def node_writer(state: AgentState) -> AgentState:
         )
         return state
 
-    # Build a lookup for discovered papers metadata
-    paper_lookup = {p["url"].strip().rstrip("/").lower(): p for p in papers if "url" in p}
-
-    # Build the contexts block for the prompt
     contexts_block_parts: list[str] = []
     for i, ctx in enumerate(contexts, start=1):
-        url = ctx.get('url', '')
-        norm_url = url.strip().rstrip("/").lower()
-        paper = paper_lookup.get(norm_url, {})
-
-        title = paper.get('title') or "Unknown Title"
-        year = paper.get('publication_year')
-        year_str = str(year) if year else "Unknown"
-        authors = paper.get('authors') or "Unknown Authors"
-        citations = paper.get('citation_count')
-        citations_str = str(citations) if citations is not None else "N/A"
-
-        key_points_str = "\n".join(f"  • {kp}" for kp in ctx.get("key_points", []))
-        citations_str_list = "\n".join(f"  • {c}" for c in ctx.get("citations", [])[:5])
+        kp_str   = "\n".join(f"  • {kp}" for kp in ctx.get("key_points", []))
+        cite_str = "\n".join(f"  • {c}"  for c  in ctx.get("citations",   [])[:5])
+        year_str = str(ctx.get("publication_year", "Unknown"))
         part = textwrap.dedent(f"""
-            --- Paper {i} ---
-            Title: {title}
-            URL: {url}
-            Publication Year: {year_str}
-            Authors: {authors}
-            Citation Count: {citations_str}
-            SUMMARY: {ctx.get('content_summary', '')}
+            --- Paper {i} ({ctx.get('source','').upper()}) ---
+            Title    : {ctx.get('title', 'N/A')}
+            Authors  : {ctx.get('authors', 'Unknown')}
+            Year     : {year_str}
+            URL      : {ctx.get('url', 'N/A')}
+            SUMMARY  : {ctx.get('content_summary', '')}
             METHODOLOGY: {ctx.get('methodology', 'Not specified')}
             KEY POINTS:
-            {key_points_str}
-            RELEVANCE TO TOPIC: {ctx.get('relevance_to_topic', '')}
+            {kp_str}
+            RELEVANCE: {ctx.get('relevance_to_topic', '')}
             CITED WORKS:
-            {citations_str_list}
+            {cite_str}
         """).strip()
         contexts_block_parts.append(part)
 
     contexts_block = "\n\n".join(contexts_block_parts)
-    errors_block = "\n".join(f"- {e}" for e in errors) if errors else "None"
+    errors_block   = "\n".join(f"- {e}" for e in errors) if errors else "None"
 
     try:
         report = _writer_chain.invoke({
-            "topic": topic,
+            "topic":         topic,
+            "search_mode":   mode,
+            "year_from":     year_from,
+            "year_to":       year_to,
+            "num_scholar":   num_scholar,
+            "num_web":       num_web,
             "contexts_block": contexts_block,
-            "errors_block": errors_block,
+            "errors_block":  errors_block,
         })
         state["draft_report"] = report
         logger.info(
             "[Writer] Complete | chars=%d | elapsed=%.2fs",
-            len(report),
-            time.perf_counter() - start,
+            len(report), time.perf_counter() - start,
         )
     except Exception as exc:
-        msg = f"[Writer] Failed to generate report: {exc}"
+        msg = f"[Writer] Failed: {exc}"
         logger.error(msg, exc_info=True)
-        state["error_log"] = state.get("error_log", []) + [msg]
+        state["error_log"]    = state.get("error_log", []) + [msg]
         state["draft_report"] = f"[WRITER_ERROR] Report generation failed: {exc}"
 
     return state
