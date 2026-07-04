@@ -20,30 +20,30 @@ class AgentState(TypedDict):
     Single shared object that flows through every graph node.
     Every field has a named owner and a documented lifecycle.
     """
-    # ── User inputs ───────────────────────────────────────────────────────────
+    # ── User inputs
     topic:       str
     search_mode: Literal["default", "scholar_only"]  # set by run_research()
     year_from:   int   # floor year for Scholar windows  (current_year - SCHOLAR_YEARS)
     year_to:     int   # ceiling year                    (current_year)
 
-    # ── Discovery outputs ─────────────────────────────────────────────────────
+    # ── Discovery outputs
     scholar_papers:    list[PaperMeta]   # papers found via Google Scholar
     web_papers:        list[PaperMeta]   # papers found via Tavily (default mode only)
     discovered_papers: list[PaperMeta]  # combined, deduped, ordered newest-first
     search_queries:    list[str]         # all queries that were fired
     discovery_raw:     str               # concatenated raw tool output (debug)
 
-    # ── Extraction outputs ────────────────────────────────────────────────────
+    # ── Extraction outputs
     extracted_contexts: list[dict]   # {url, content_summary, key_points, ...}
     extraction_errors:  list[str]    # URLs that failed quality gate or errored
 
-    # ── Writer output ─────────────────────────────────────────────────────────
+    # ── Writer output
     draft_report: str
 
-    # ── Evaluator output ──────────────────────────────────────────────────────
+    # ── Evaluator output
     evaluation: dict   # relevance/coverage/synthesis/citation scores + verdict
 
-    # ── Control flow ──────────────────────────────────────────────────────────
+    # ── Control flow
     retry_count: int
     error_log:   list[str]
 

@@ -1,8 +1,4 @@
 """
-tools.py — Lexaras Research Platform
--------------------------------------
-All LangChain-compatible tools used by the agent pipeline.
-
 Tools:
     web_search          — Tavily web search (general web, blogs, preprints)
     scholar_search      — Google Scholar search via SerpApi with year-descending

@@ -1,8 +1,4 @@
 """
-app.py — Lexaras Research Platform UI
-----------------------------------------
-Streamlit frontend for the Lexaras multi-agent research pipeline.
-
 Run with:
     streamlit run app.py
 """

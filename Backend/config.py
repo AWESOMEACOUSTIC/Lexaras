@@ -1,11 +1,4 @@
 """
-config.py — Lexaras Research Platform
----------------------------------------
-Centralised application configuration using Pydantic BaseSettings.
-
-All secrets validated at startup — a missing key is a startup crash,
-not a silent None that surfaces 45 seconds into a pipeline run.
-
 New in this version:
     - SERPAPI_API_KEY  : required for Google Scholar search
     - SEARCH_MODE      : "default" | "scholar_only"
