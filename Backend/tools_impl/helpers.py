@@ -1,6 +1,8 @@
 import logging
 import re
 import requests
+import textwrap
+from typing import Optional
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from tenacity import (
@@ -14,11 +16,12 @@ from tenacity import (
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_SNIPPET_CHARS = 500       # per Tavily result snippet
-MAX_SCRAPED_CHARS = 4_000     # per scraped page (well within Mistral context)
-MAX_PDF_CHARS = 6_000         # PDFs tend to be denser; give more room
-SCRAPE_TIMEOUT_SEC = 12
-SEARCH_MAX_RESULTS = 5        # increased from 2 — gives agents more signal
+MAX_SNIPPET_CHARS   = 500
+MAX_SCRAPED_CHARS   = 4_000
+MAX_PDF_CHARS       = 6_000
+SCRAPE_TIMEOUT_SEC  = 12
+SERPAPI_TIMEOUT_SEC = 15
+WEB_MAX_RESULTS     = 5    # per Tavily call in default mode
 
 _HTTP_HEADERS = {
     "User-Agent": (
@@ -94,3 +97,33 @@ def _fetch_with_retry(url: str) -> requests.Response:
     resp = _session.get(url, timeout=SCRAPE_TIMEOUT_SEC, allow_redirects=True)
     resp.raise_for_status()
     return resp
+
+
+def _result_envelope(
+    index: int,
+    title: str,
+    url: str,
+    snippet: str,
+    source: str,                    # "scholar" | "web"
+    publication_year: Optional[int],
+    authors: Optional[str] = None,
+    citation_count: Optional[int] = None,
+) -> str:
+    """
+    Single consistent text block for every search result, regardless of source.
+    Downstream agents parse this uniformly — they never need to know whether
+    the result came from SerpApi or Tavily.
+    """
+    year_str    = str(publication_year) if publication_year else "Unknown"
+    authors_str = authors if authors else "Unknown"
+    cite_str    = str(citation_count) if citation_count is not None else "N/A"
+
+    return textwrap.dedent(f"""
+    [{index}] {title}
+        Source       : {source.upper()}
+        URL          : {url}
+        Year         : {year_str}
+        Authors      : {authors_str}
+        Citations    : {cite_str}
+        Snippet      : {snippet}
+    """).strip()
