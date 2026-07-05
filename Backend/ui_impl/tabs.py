@@ -10,7 +10,7 @@ def render_report_tab(r: dict, topic_label: str) -> None:
             f'<div class="report-body">{md_to_html(draft)}</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
         st.download_button(
             label="⬇  Download as Markdown",
             data=draft,
@@ -49,19 +49,13 @@ def render_sources_tab(r: dict) -> None:
             url = ctx.get("url", "—")
             key_points = ctx.get("key_points", [])
             with st.expander(f"📄  {url[:75]}{'…' if len(url) > 75 else ''}"):
-                st.markdown(f"""
-                <div style="font-size:0.82rem; color:#6666a0;
-                            margin-bottom:0.6rem; word-break:break-all;">
-                    {url}
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown(f'<div class="extract-url">{url}</div>', unsafe_allow_html=True)
+
                 if ctx.get("content_summary"):
-                    st.markdown(f"""
-                    <div style="font-size:0.86rem; color:#b8b8d8;
-                                line-height:1.7; margin-bottom:0.8rem;">
-                        {ctx["content_summary"]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="extract-summary">{ctx["content_summary"]}</div>',
+                        unsafe_allow_html=True,
+                    )
                 if key_points:
                     kp_items = "".join(f'<li><span class="kp-bullet">›</span> <div>{kp}</div></li>' for kp in key_points)
                     st.markdown(
@@ -69,13 +63,10 @@ def render_sources_tab(r: dict) -> None:
                         unsafe_allow_html=True,
                     )
                 if ctx.get("methodology"):
-                    st.markdown(f"""
-                    <div style="margin-top:0.7rem; font-size:0.8rem;
-                                color:#9090b8;">
-                        <strong style="color:#d0d0e8;">Methodology:</strong>
-                        {ctx["methodology"]}
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="extract-methodology"><strong>Methodology:</strong> {ctx["methodology"]}</div>',
+                        unsafe_allow_html=True,
+                    )
 
 def render_evaluation_tab(r: dict) -> None:
     ev = r.get("evaluation", {})
@@ -105,7 +96,7 @@ def render_evaluation_tab(r: dict) -> None:
         """, unsafe_allow_html=True)
 
         # Dimension score bars
-        st.markdown('<div class="sec-label" style="margin-top:1rem;">Dimension Scores</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-label" style="margin-top:0.5rem;">Dimension Scores</div>', unsafe_allow_html=True)
         dims = [
             ("Relevance",  ev.get("relevance_score",  0)),
             ("Coverage",   ev.get("coverage_score",   0)),
@@ -143,7 +134,7 @@ def render_evaluation_tab(r: dict) -> None:
             st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
             st.markdown('<div class="sec-label">Improvement Suggestions</div>', unsafe_allow_html=True)
             items = "".join(
-                f'<li><span class="fb-icon" style="color:#7c74ff;">→</span> <div>{s}</div></li>'
+                f'<li><span class="fb-icon" style="color:#8b83ff;">→</span> <div>{s}</div></li>'
                 for s in suggestions
             )
             st.markdown(f'<ul class="fb-list">{items}</ul>', unsafe_allow_html=True)
@@ -167,7 +158,7 @@ def render_debug_tab(r: dict) -> None:
             </div>
             """, unsafe_allow_html=True)
     else:
-        st.markdown('<div style="color:#44445a; font-size:0.84rem;">None recorded.</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#404068; font-size:0.84rem;">None recorded.</div>', unsafe_allow_html=True)
 
     retry_count = r.get("retry_count", 0)
     if retry_count:
@@ -190,4 +181,3 @@ def render_debug_tab(r: dict) -> None:
     st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
     with st.expander("Raw discovery output"):
         st.text(r.get("discovery_raw", "—"))
-
