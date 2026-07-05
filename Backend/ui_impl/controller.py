@@ -76,7 +76,7 @@ def score_bar_html(label: str, value: int, max_val: int = 10) -> str:
     """
 
 
-def run_pipeline(topic: str) -> dict:
+def run_pipeline(topic: str, search_mode: str = "default") -> dict:
     """
     Runner wrapper around agents.run_research().
     sys.path injection ensures the import works from any working directory.
@@ -85,4 +85,4 @@ def run_pipeline(topic: str) -> dict:
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)
     from agents import run_research
-    return run_research(topic)
+    return run_research(topic, search_mode=search_mode)

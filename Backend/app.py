@@ -61,8 +61,8 @@ st.markdown("""
 <div class="lex-header">
     <div style="display:flex; align-items:baseline; gap:0;">
         <span class="lex-wordmark">◈ Lex<span class="lex-wordmark-accent">aras</span></span>
-        <span class="lex-tagline">research intelligence</span>
     </div>
+    <span class="lex-tagline">research intelligence</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -88,7 +88,7 @@ with left:
         label_visibility="collapsed",
     )
 
-    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     run_btn = st.button("Run Research  →", use_container_width=True)
 
     st.markdown('<hr class="lex-hr">', unsafe_allow_html=True)
@@ -105,17 +105,17 @@ with left:
     if st.session_state.results:
         render_metrics(metrics_slot, st.session_state.results, st.session_state.elapsed)
     else:
-        # Render empty stats placeholder
+        # Empty stats placeholder — clean dashes
         metrics_slot.markdown("""
         <div class="metric-grid">
             <div class="metric-pill"><div class="mp-label">Papers found</div><div class="mp-value c-muted">—</div></div>
             <div class="metric-pill"><div class="mp-label">Extracted</div><div class="mp-value c-muted">—</div></div>
             <div class="metric-pill"><div class="mp-label">Report words</div><div class="mp-value c-muted">—</div></div>
             <div class="metric-pill"><div class="mp-label">Overall score</div><div class="mp-value c-muted">—</div></div>
-            <div class="metric-pill full-width">
-                <div class="mp-label">Elapsed time</div>
-                <div class="mp-value c-muted">—</div>
-            </div>
+        </div>
+        <div class="elapsed-row">
+            <div class="elapsed-label">Elapsed</div>
+            <div class="elapsed-value">—</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -179,7 +179,7 @@ with right:
         topic_label = st.session_state.topic
         errors = r.get("extraction_errors", [])
         
-        # New topic heading layout
+        # Topic heading card with accent border-top
         st.markdown(f"""
         <div class="topic-heading">
             <div class="topic-label">Research output for</div>
@@ -195,6 +195,7 @@ with right:
                 f'<div class="warn-chip">⚠ {len(errors)} paper(s) failed to extract</div>',
                 unsafe_allow_html=True,
             )
+            st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
 
         tab_report, tab_papers, tab_eval, tab_debug = st.tabs([
             "📄 Report",
