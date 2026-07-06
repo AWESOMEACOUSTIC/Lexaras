@@ -32,13 +32,21 @@ _EXTRACTION_SYSTEM = textwrap.dedent("""
        say so explicitly in content_summary — NEVER fabricate content.
     5. For Scholar papers, prefer the direct PDF link over the landing page when
        available — PDFs contain the full paper text.
-    6. Extract any in-text citations or references that could lead to more papers.
+    6. For SCHOLAR papers where the URL cannot be scraped (paywall, JS-rendered
+       SPA, empty page), you may use the provided Initial Snippet (which is the
+       abstract from Google Scholar) to create a minimal extraction. In this case:
+       - Set content_summary to a summary based ONLY on the snippet text.
+       - Prefix content_summary with "[ABSTRACT_ONLY] ".
+       - key_points should be derived from what the snippet actually says.
+       - methodology should be "Not available — abstract only".
+       - Do NOT invent claims beyond what the snippet states.
+    7. Extract any in-text citations or references that could lead to more papers.
 
     OUTPUT CONSTRAINTS:
     - Return ONLY valid JSON. No preamble, no markdown fences.
     - key_points must be full sentences (not fragments or headlines).
-    - If insufficient content was found, set content_summary to "[INSUFFICIENT_CONTENT]"
-      and explain why (paywall, 404, irrelevant page, etc.).
+    - If insufficient content was found AND no usable snippet is available,
+      set content_summary to "[INSUFFICIENT_CONTENT]" and explain why.
 """).strip()
 
 _EXTRACTION_HUMAN = textwrap.dedent("""
@@ -129,6 +137,28 @@ def node_extraction(state: AgentState) -> AgentState:
 
             summary = parsed.get("content_summary", "")
             if "[INSUFFICIENT_CONTENT]" in summary or len(summary) < 100:
+                # ── Snippet-based fallback for Scholar papers ──────────────
+                snippet = paper.get("snippet", "").strip()
+                if source == "scholar" and len(snippet) > 50:
+                    logger.info(
+                        "[Extraction] Using snippet fallback for Scholar paper | url=%s",
+                        url,
+                    )
+                    parsed = {
+                        "url":                url,
+                        "content_summary":    f"[ABSTRACT_ONLY] {snippet}",
+                        "key_points":         [snippet] if snippet else [],
+                        "methodology":        "Not available — abstract only",
+                        "citations":          [],
+                        "relevance_to_topic": paper.get("relevance_note", "Relevance assessment unavailable."),
+                        "source":             source,
+                        "publication_year":   pub_year,
+                        "authors":            authors,
+                        "title":              title,
+                    }
+                    contexts.append(parsed)
+                    continue
+
                 logger.warning("[Extraction] Low-quality content | url=%s", url)
                 errors.append(f"Insufficient content from: {url} (source: {source})")
                 continue
