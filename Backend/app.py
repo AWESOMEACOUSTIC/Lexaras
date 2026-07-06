@@ -33,7 +33,7 @@ st.set_page_config(
 load_styles()
 
 # ── Inject layout classes via JS
-st.components.v1.html("""
+st.html("""
 <script>
     const cols = window.parent.document.querySelectorAll('[data-testid="column"]');
     if (cols.length >= 2) {
@@ -41,7 +41,7 @@ st.components.v1.html("""
         cols[1].classList.add('panel-right');
     }
 </script>
-""", height=0, width=0)
+""")
 
 # ── Session state initialisation
 _DEFAULTS = {
