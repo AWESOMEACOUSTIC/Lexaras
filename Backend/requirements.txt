@@ -40,7 +40,12 @@ tavily-python>=0.7.25
 langchain-tavily>=0.2.18
 
 # ------------------------------------------------------------
-# Tool 2 — BeautifulSoup (HTML Parsing & Scraping)
+# Tool 2 — SerpApi (Google Scholar Search — official Python client)
+# ------------------------------------------------------------
+serpapi>=1.0.0
+
+# ------------------------------------------------------------
+# Tool 3 — BeautifulSoup (HTML Parsing & Scraping)
 # ------------------------------------------------------------
 beautifulsoup4>=4.12.3
 lxml>=5.3.0
