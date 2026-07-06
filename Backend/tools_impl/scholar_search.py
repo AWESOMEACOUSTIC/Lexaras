@@ -3,6 +3,7 @@ import re
 import time
 from typing import Optional
 
+import serpapi
 import requests
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field, field_validator
@@ -19,27 +20,21 @@ from tools_impl.helpers import (
     _trim_to_sentence,
     _result_envelope,
     _is_valid_url,
-    _session,
     MAX_SNIPPET_CHARS,
-    SERPAPI_TIMEOUT_SEC,
 )
 
 logger = logging.getLogger(__name__)
 
+# ── SerpApi client (official Python library) ───────────────────────────────────
+_serpapi_client = serpapi.Client(api_key=settings.SERPAPI_API_KEY)
 
-# ── Call SerpApi with its own retry logic ──────────────────────────────────────
+
 def _call_serpapi(params: dict) -> dict:
     """
-    Low-level SerpApi HTTP call, isolated so Tenacity wraps only this.
-    Raises requests.HTTPError on 4xx/5xx so the retry decorator can act.
+    Call SerpApi using the official Python client.
+    Isolated so Tenacity can wrap just this call for network-level retries.
     """
-    resp = _session.get(
-        "https://serpapi.com/search",
-        params=params,
-        timeout=SERPAPI_TIMEOUT_SEC,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _serpapi_client.search(params)
 
 
 _serpapi_retry = retry(
@@ -182,7 +177,6 @@ def execute_scholar_search_raw(
     params = {
         "engine":   "google_scholar",
         "q":        query,
-        "api_key":  settings.SERPAPI_API_KEY,
         "num":      min(max_results * 2, 20),  # fetch extra; we filter and deduplicate
         "as_ylo":   year_from,
         "as_yhi":   year_to,
@@ -192,15 +186,12 @@ def execute_scholar_search_raw(
 
     try:
         data = _call_serpapi(params)
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response else "unknown"
-        logger.error("scholar_search HTTP error | status=%s | query=%r", status, query)
-        if status == 429:
-            raise RuntimeError("SerpApi rate limit reached (HTTP 429).")
-        raise RuntimeError(f"SerpApi returned HTTP status {status}.")
     except Exception as exc:
         logger.error("scholar_search error | query=%r | %s", query, exc)
-        raise exc
+        err_msg = str(exc).lower()
+        if "rate" in err_msg or "429" in err_msg:
+            raise RuntimeError("SerpApi rate limit reached (HTTP 429).")
+        raise RuntimeError(f"SerpApi search failed: {exc}")
 
     if "error" in data:
         logger.error("scholar_search SerpApi error | %s", data["error"])

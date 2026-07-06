@@ -25,7 +25,7 @@ WEB_MAX_RESULTS     = 5    # per Tavily call in default mode
 
 _HTTP_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; LexarasBot/1.0; +https://lexaras.ai/bot)"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
