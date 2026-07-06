@@ -91,11 +91,39 @@ _network_retry = retry(
     reraise=True,
 )
 
+def _is_redirect_drift(original_url: str, final_url: str) -> bool:
+    """
+    Check if the final URL is a generic homepage/root path but the original URL
+    was targeting a specific path, indicating the link was redirected to a homepage.
+    """
+    orig_parsed = urlparse(original_url)
+    final_parsed = urlparse(final_url)
+    
+    if original_url == final_url:
+        return False
+        
+    orig_path = orig_parsed.path.strip("/")
+    final_path = final_parsed.path.strip("/")
+    
+    # Generic homepage/index paths
+    generic_paths = {"", "index.html", "index.htm", "home", "welcome", "main"}
+    
+    if orig_path not in generic_paths and final_path in generic_paths:
+        return True
+        
+    return False
+
+
 @_network_retry
 def _fetch_with_retry(url: str) -> requests.Response:
     """Isolated so tenacity can wrap just the network call."""
     resp = _session.get(url, timeout=SCRAPE_TIMEOUT_SEC, allow_redirects=True)
     resp.raise_for_status()
+    
+    if resp.history:
+        if _is_redirect_drift(url, resp.url):
+            raise ValueError(f"Redirect drift detected: {url} redirected to homepage {resp.url}")
+            
     return resp
 
 
