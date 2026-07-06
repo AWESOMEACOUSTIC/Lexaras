@@ -23,6 +23,19 @@ _EXTRACTION_SYSTEM = textwrap.dedent("""
     valuable insights in a structured, citation-aware format.
 
     OPERATING PRINCIPLES:
+    0. BEFORE summarizing, classify what you actually scraped. Set content_type to:
+       - "paper_content"  — the full paper or a substantial portion of it
+       - "abstract_only"  — only an abstract/teaser is visible (e.g. paywalled)
+       - "access_wall"    — page is dominated by sign-in, purchase, cookie-consent,
+                            or "enable JavaScript" messaging
+       - "unrelated_page" — a homepage, error page, listing page, or content that
+                            does not match the paper title
+       Also rate topic_relevance ("high", "medium", "low", "none") based on how
+       well the ACTUAL scraped content relates to the research topic — not the
+       title or snippet.
+       If content_type is "access_wall" or "unrelated_page", or topic_relevance
+       is "low" or "none", leave content_summary/key_points/methodology EMPTY.
+       Reporting an unusable page correctly is a SUCCESS, not a failure.
     1. Read with the research topic always in mind — extract what is *relevant*,
        not everything on the page.
     2. Identify the paper's thesis, methodology, key findings, and limitations.
@@ -68,6 +81,8 @@ _EXTRACTION_HUMAN = textwrap.dedent("""
     Respond in this exact JSON format:
     {{
         "url": "{url}",
+        "content_type": "paper_content | abstract_only | access_wall | unrelated_page",
+        "topic_relevance": "high | medium | low | none",
         "content_summary": "...",
         "key_points": ["...", "..."],
         "methodology": "...",
@@ -75,6 +90,22 @@ _EXTRACTION_HUMAN = textwrap.dedent("""
         "relevance_to_topic": "..."
     }}
 """).strip()
+
+
+_WALL_MARKERS = (
+    "sign in to read", "purchase access", "institutional login",
+    "buy this article", "access through your institution",
+    "we use cookies", "cookie consent", "accept all cookies",
+    "subscribe to continue", "javascript is required",
+    "enable javascript",
+)
+
+
+def _looks_like_wall(text: str) -> bool:
+    """Cheap backstop in case the LLM misclassifies a wall as content."""
+    lowered = text.lower()
+    hits = sum(m in lowered for m in _WALL_MARKERS)
+    return hits >= 2 or (hits >= 1 and len(text) < 2000)
 
 
 def node_extraction(state: AgentState) -> AgentState:
@@ -135,17 +166,34 @@ def node_extraction(state: AgentState) -> AgentState:
             cleaned = _strip_fences(raw)
             parsed: dict = json.loads(cleaned)
 
-            summary = parsed.get("content_summary", "")
-            if "[INSUFFICIENT_CONTENT]" in summary or len(summary) < 100:
+            summary        = parsed.get("content_summary", "")
+            content_type   = parsed.get("content_type", "paper_content")
+            relevance      = parsed.get("topic_relevance", "high")
+
+            usable = (
+                content_type in ("paper_content", "abstract_only")
+                and relevance in ("high", "medium")
+                and "[INSUFFICIENT_CONTENT]" not in summary
+                and len(summary) >= 100
+                and not _looks_like_wall(summary)
+            )
+
+            if not usable:
                 # ── Snippet-based fallback for Scholar papers ──────────────
                 snippet = paper.get("snippet", "").strip()
-                if source == "scholar" and len(snippet) > 50:
+                # Only fall back for access problems — if the content was read
+                # and judged off-topic, the snippet won't rescue it.
+                access_problem = content_type in ("access_wall", "unrelated_page") \
+                    or "[INSUFFICIENT_CONTENT]" in summary or len(summary) < 100
+                if source == "scholar" and len(snippet) > 50 and access_problem:
                     logger.info(
                         "[Extraction] Using snippet fallback for Scholar paper | url=%s",
                         url,
                     )
                     parsed = {
                         "url":                url,
+                        "content_type":       "abstract_only",
+                        "topic_relevance":    "medium",
                         "content_summary":    f"[ABSTRACT_ONLY] {snippet}",
                         "key_points":         [snippet] if snippet else [],
                         "methodology":        "Not available — abstract only",
@@ -155,12 +203,19 @@ def node_extraction(state: AgentState) -> AgentState:
                         "publication_year":   pub_year,
                         "authors":            authors,
                         "title":              title,
+                        "evidence_level":     "abstract_only",
                     }
                     contexts.append(parsed)
                     continue
 
-                logger.warning("[Extraction] Low-quality content | url=%s", url)
-                errors.append(f"Insufficient content from: {url} (source: {source})")
+                logger.warning(
+                    "[Extraction] Rejected | type=%s relevance=%s url=%s",
+                    content_type, relevance, url,
+                )
+                errors.append(
+                    f"Unusable content from: {url} "
+                    f"(source: {source}, type: {content_type}, relevance: {relevance})"
+                )
                 continue
 
             # Enrich parsed context with paper metadata for the writer
@@ -168,6 +223,9 @@ def node_extraction(state: AgentState) -> AgentState:
             parsed["publication_year"] = pub_year
             parsed["authors"]          = authors
             parsed["title"]            = title
+            parsed["evidence_level"]   = (
+                "abstract_only" if content_type == "abstract_only" else "full_text"
+            )
 
             contexts.append(parsed)
             logger.info("[Extraction] Success | paper=%d | url=%s", i, url)
