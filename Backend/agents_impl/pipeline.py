@@ -107,13 +107,15 @@ def run_research(
 
     Returns:
         Final AgentState dict. Key fields for the caller:
-            draft_report       — full Markdown research report
-            evaluation         — dict with scores and verdict
-            discovered_papers  — list of PaperMeta dicts
-            scholar_papers     — Scholar-only subset
-            web_papers         — Tavily-only subset
-            extraction_errors  — list of failed URLs
-            error_log          — pipeline-level non-fatal errors
+            draft_report             — full Markdown research report
+            evaluation                — dict with scores (incl. register_score) and verdict
+            discovered_papers         — list of PaperMeta dicts
+            scholar_papers             — Scholar-only subset
+            web_papers                — Tavily-only subset
+            extraction_errors         — list of failed URLs
+            error_log                 — pipeline-level non-fatal errors
+            writer_register_score     — writer's own pre-revision register self-score (0-10) or None
+            writer_register_revised   — whether the writer's automatic tone-revision pass ran
     """
     if not topic or not topic.strip():
         raise ValueError("Research topic must be a non-empty string.")
@@ -147,6 +149,13 @@ def run_research(
         "extracted_contexts": [],
         "extraction_errors": [],
         "draft_report":      "",
+        # Owned by node_writer's self-critique pass (writer.py). Defaulted
+        # here so the field is always present for the evaluator to read via
+        # state.get(...) — None/False, not omitted, so a run where the
+        # critique pass never executes (or fails) is distinguishable from
+        # one that hasn't reached the writer node yet.
+        "writer_register_score":   None,
+        "writer_register_revised": False,
         "evaluation":        {},
         "retry_count":       0,
         "error_log":         [],
