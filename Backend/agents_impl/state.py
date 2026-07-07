@@ -39,9 +39,16 @@ class AgentState(TypedDict):
 
     # ── Writer output
     draft_report: str
+    # Owned by node_writer's self-critique pass (see writer.py). register_score
+    # is the writer's OWN pre-revision assessment (0-10, out of the same
+    # register rubric the evaluator independently re-checks below) —
+    # optional because older runs / a failed critique call leave it unset.
+    # Default to None/False at initial-state construction time in pipeline.py.
+    writer_register_score:   Optional[int]
+    writer_register_revised: Optional[bool]
 
     # ── Evaluator output
-    evaluation: dict   # relevance/coverage/synthesis/citation scores + verdict
+    evaluation: dict   # relevance/coverage/synthesis/citation/recency/register scores + verdict
 
     # ── Control flow
     retry_count: int
@@ -75,8 +82,16 @@ class EvaluationOutput(BaseModel):
     citation_score:         int   = Field(ge=0, le=10)
     recency_score:          int   = Field(ge=0, le=10,
         description="How recent are the papers? Penalise if most are older than 3 years")
+    register_score:         int   = Field(ge=0, le=10,
+        description=(
+            "Independent evaluator judgement of academic-register adherence in "
+            "the FINAL report text — no first person, no contractions, no "
+            "rhetorical questions/exclamation marks, precise (not vague) "
+            "hedging. Judged directly from the report, not deferred to the "
+            "writer's own self-critique score."
+        ))
     overall_score:          float
     strengths:              list[str]
-    weaknesses:             list[str]
+    weaknesses:              list[str]
     improvement_suggestions: list[str]
     verdict:                str
