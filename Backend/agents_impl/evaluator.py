@@ -31,14 +31,38 @@ _EVALUATOR_SYSTEM = textwrap.dedent("""
     4. Citation       — Is every claim backed by a traceable source with a URL?
     5. Recency        — Are papers recent? Penalise if most are older than 3 years.
                         Google Scholar papers with year metadata are weighted higher.
+    6. Register       — Does the FINAL report text hold a rigorous academic register
+                        throughout? Judge this yourself, directly against the report
+                        text below — do not defer to any writer self-assessment you
+                        are given as context. Score 10 only if none of the following
+                        appear anywhere in the report:
+                          - First-person pronouns ("I", "we", "our") outside a
+                            direct quotation from a source.
+                          - Contractions ("don't", "it's", "can't").
+                          - Rhetorical questions.
+                          - Exclamation marks.
+                          - Casual sentence openers ("So,", "Basically,",
+                            "Interestingly,", "Anyway,").
+                          - Vague hedging ("it seems", "might", "probably",
+                            "who knows") where precise hedging was possible
+                            (e.g. naming the specific year/gap in evidence instead).
+                          - Filler lead-ins ("It is important to note that",
+                            "It is worth mentioning that").
+                        Deduct roughly 1-2 points per distinct violation type found,
+                        more if a violation recurs throughout the report rather than
+                        appearing once.
 
     OVERALL SCORE formula:
-        overall = relevance*0.25 + coverage*0.20 + synthesis*0.25 + citation*0.15 + recency*0.15
+        overall = relevance*0.20 + coverage*0.15 + synthesis*0.20 + citation*0.15
+                 + recency*0.15 + register*0.15
 
     OUTPUT CONSTRAINTS:
     - Return ONLY valid JSON. No preamble, no markdown fences.
     - improvement_suggestions must be specific, actionable, not vague.
     - recency_score should penalise heavily if most papers are 4+ years old.
+    - register_score must be justified by at least one specific example (a quoted
+      phrase from the report) in weaknesses if it is below 8 — do not dock points
+      without pointing to what triggered the deduction.
 """).strip()
 
 _EVALUATOR_HUMAN = textwrap.dedent("""
@@ -53,6 +77,14 @@ _EVALUATOR_HUMAN = textwrap.dedent("""
     Error Details      : {errors_summary}
     Year Distribution  : {year_distribution}
 
+    === WRITER SELF-ASSESSMENT (context only — verify independently, do not defer) ===
+    Pre-revision register self-score : {writer_register_score}
+    Automatic revision pass applied  : {writer_register_revised}
+    Note: this is the writer's own judgment of its first draft, before any
+    revision pass ran. It may be optimistic, or the revision pass itself may
+    have introduced new issues. Score register_score entirely from the actual
+    report text below.
+
     === DRAFTED REPORT ===
     {draft_report}
 
@@ -66,6 +98,7 @@ _EVALUATOR_HUMAN = textwrap.dedent("""
         "synthesis_score": <0-10>,
         "citation_score": <0-10>,
         "recency_score": <0-10>,
+        "register_score": <0-10>,
         "overall_score": <float>,
         "strengths": ["...", "..."],
         "weaknesses": ["...", "..."],
@@ -83,8 +116,15 @@ _evaluator_chain = _evaluator_prompt | llm | StrOutputParser()
 
 def node_evaluator(state: AgentState) -> AgentState:
     """
-    Evaluator node — scores the pipeline output including the new recency dimension.
-    Passes year distribution stats so the evaluator can penalise stale paper sets.
+    Evaluator node — scores the pipeline output across relevance, coverage,
+    synthesis, citation, recency, and register.
+
+    Register is judged independently here, directly from the final report
+    text, even though the writer node already runs its own self-critique
+    pass (see writer.py). The two are intentionally separate checks: the
+    writer's self-critique is a cheap, in-process pass that can revise before
+    the report ships; this evaluator pass is the independent, ground-truth
+    quality gate that doesn't trust the writer's own grading of itself.
     """
     topic     = state["topic"]
     mode      = state["search_mode"]
@@ -122,6 +162,21 @@ def node_evaluator(state: AgentState) -> AgentState:
         )
     contexts_summary = "\n".join(ctx_lines) if ctx_lines else "No contexts available."
 
+    # Writer self-assessment, passed through as context only (see prompt note
+    # instructing the evaluator not to defer to it). Both are optional — an
+    # older run, or a run where the writer's critique pass itself failed and
+    # degraded gracefully, may leave these unset.
+    writer_register_score = state.get("writer_register_score")
+    writer_register_score_str = (
+        str(writer_register_score) if writer_register_score is not None
+        else "Not available (self-critique did not run or was not recorded)"
+    )
+    writer_register_revised = state.get("writer_register_revised")
+    writer_register_revised_str = (
+        str(writer_register_revised) if writer_register_revised is not None
+        else "Unknown"
+    )
+
     logger.info("[Evaluator] Starting | topic=%r | mode=%s", topic, mode)
     start = time.perf_counter()
 
@@ -138,6 +193,8 @@ def node_evaluator(state: AgentState) -> AgentState:
             "num_errors":       len(errors),
             "errors_summary":   "; ".join(errors[:3]) if errors else "None",
             "year_distribution": year_dist_str,
+            "writer_register_score":    writer_register_score_str,
+            "writer_register_revised":  writer_register_revised_str,
             "draft_report":     draft[:3000],
             "contexts_summary": contexts_summary,
         })
@@ -147,9 +204,10 @@ def node_evaluator(state: AgentState) -> AgentState:
         state["evaluation"] = evaluation
 
         logger.info(
-            "[Evaluator] Complete | overall=%.1f | recency=%s | elapsed=%.2fs",
+            "[Evaluator] Complete | overall=%.1f | recency=%s | register=%s | elapsed=%.2fs",
             evaluation.get("overall_score", 0),
             evaluation.get("recency_score", "?"),
+            evaluation.get("register_score", "?"),
             time.perf_counter() - start,
         )
 
