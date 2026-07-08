@@ -2,12 +2,14 @@ import json
 import logging
 import textwrap
 import time
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt import create_react_agent
 
 from tools import READER_TOOLS
 from agents_impl.state import AgentState
 from agents_impl.llm import llm
+from tools_impl.helpers import CONTENT_QUALITY_FLAG_PREFIX
+from tools_impl.domain_reputation import record_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,12 @@ _EXTRACTION_SYSTEM = textwrap.dedent("""
        Also rate topic_relevance ("high", "medium", "low", "none") based on how
        well the ACTUAL scraped content relates to the research topic — not the
        title or snippet.
+       If a tool result begins with a line starting "CONTENT_QUALITY_FLAG:",
+       treat that as authoritative — it means an automated check already
+       determined the page is an access wall or low-quality scrape. Set
+       content_type to "access_wall" (or "unrelated_page" if the flag reason
+       indicates unrelated/garbage text) accordingly, even if the remaining
+       text looks superficially readable.
        If content_type is "access_wall" or "unrelated_page", or topic_relevance
        is "low" or "none", leave content_summary/key_points/methodology EMPTY.
        Reporting an unusable page correctly is a SUCCESS, not a failure.
@@ -102,10 +110,42 @@ _WALL_MARKERS = (
 
 
 def _looks_like_wall(text: str) -> bool:
-    """Cheap backstop in case the LLM misclassifies a wall as content."""
+    """
+    Cheap backstop in case the LLM misclassifies a wall as content. This
+    checks the LLM's OWN SUMMARY text — kept as a redundant, cheap second
+    layer, but note it is weaker than the deterministic raw-content check
+    below (`_raw_output_flagged_quality_issue`), since a paraphrased summary
+    of a wall page may not reuse these exact phrases. Both checks run;
+    either one can reject.
+    """
     lowered = text.lower()
     hits = sum(m in lowered for m in _WALL_MARKERS)
     return hits >= 2 or (hits >= 1 and len(text) < 2000)
+
+
+def _raw_tool_output_flagged_quality_issue(messages: list) -> tuple[bool, str]:
+    """
+    Scans the ReAct agent's actual ToolMessage history (i.e. what scrape_url
+    / extract_pdf literally returned) for the CONTENT_QUALITY_FLAG marker
+    that the tool layer stamps on raw, pre-summarization text (see
+    tools_impl/helpers.py's `_quality_gate` / `_gate_and_prefix`).
+
+    This is deterministic and independent of what the extraction LLM later
+    claims in its structured output — it cannot be talked past by a
+    confident-sounding but wrong `content_type: "paper_content"` classification,
+    because it never looks at the LLM's summary at all, only at the raw tool
+    return value.
+    """
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            if CONTENT_QUALITY_FLAG_PREFIX in content:
+                # Grab the flag line itself for a specific, loggable reason.
+                for line in content.splitlines():
+                    if line.startswith(CONTENT_QUALITY_FLAG_PREFIX):
+                        return True, line[len(CONTENT_QUALITY_FLAG_PREFIX):].strip()
+                return True, "flag detected (reason line not found)"
+    return False, ""
 
 
 def node_extraction(state: AgentState) -> AgentState:
@@ -114,6 +154,18 @@ def node_extraction(state: AgentState) -> AgentState:
     Processes papers sequentially to respect rate limits on external servers.
     Scholar papers carry extra metadata (authors, year) injected into the prompt
     so the extractor can mention them explicitly in summaries.
+
+    Runs a defense-in-depth quality gate on top of the LLM's own self-reported
+    content_type/topic_relevance:
+      1. A deterministic check of the raw tool output for a CONTENT_QUALITY_FLAG
+         stamped by the tool layer itself (wall-marker + structural checks on
+         the actual scraped text) — this can override an LLM's incorrect claim.
+      2. The pre-existing `_looks_like_wall` check on the LLM's own summary, as
+         a cheap secondary backstop.
+
+    Also records each attempt's outcome to the domain-reputation cache
+    (tools_impl/domain_reputation.py) so discovery can learn, over time, which
+    domains are reliably extractable and which aren't.
     """
     papers = state.get("discovered_papers", [])
     topic  = state["topic"]
@@ -170,12 +222,20 @@ def node_extraction(state: AgentState) -> AgentState:
             content_type   = parsed.get("content_type", "paper_content")
             relevance      = parsed.get("topic_relevance", "high")
 
+            # Deterministic override: did the tool layer itself flag the raw
+            # scraped content as a wall / low-quality text, regardless of
+            # what the LLM's own classification says?
+            raw_flagged, raw_flag_reason = _raw_tool_output_flagged_quality_issue(
+                result["messages"]
+            )
+
             usable = (
                 content_type in ("paper_content", "abstract_only")
                 and relevance in ("high", "medium")
                 and "[INSUFFICIENT_CONTENT]" not in summary
                 and len(summary) >= 100
                 and not _looks_like_wall(summary)
+                and not raw_flagged
             )
 
             if not usable:
@@ -183,8 +243,12 @@ def node_extraction(state: AgentState) -> AgentState:
                 snippet = paper.get("snippet", "").strip()
                 # Only fall back for access problems — if the content was read
                 # and judged off-topic, the snippet won't rescue it.
-                access_problem = content_type in ("access_wall", "unrelated_page") \
-                    or "[INSUFFICIENT_CONTENT]" in summary or len(summary) < 100
+                access_problem = (
+                    content_type in ("access_wall", "unrelated_page")
+                    or "[INSUFFICIENT_CONTENT]" in summary
+                    or len(summary) < 100
+                    or raw_flagged
+                )
                 if source == "scholar" and len(snippet) > 50 and access_problem:
                     logger.info(
                         "[Extraction] Using snippet fallback for Scholar paper | url=%s",
@@ -206,16 +270,23 @@ def node_extraction(state: AgentState) -> AgentState:
                         "evidence_level":     "abstract_only",
                     }
                     contexts.append(parsed)
+                    # The scrape itself still failed (that's why we fell
+                    # back) — record it as a domain failure even though the
+                    # paper survives via the snippet.
+                    record_outcome(url, success=False)
                     continue
 
+                reason_detail = f" (raw-content flag: {raw_flag_reason})" if raw_flagged else ""
                 logger.warning(
-                    "[Extraction] Rejected | type=%s relevance=%s url=%s",
-                    content_type, relevance, url,
+                    "[Extraction] Rejected | type=%s relevance=%s url=%s%s",
+                    content_type, relevance, url, reason_detail,
                 )
                 errors.append(
                     f"Unusable content from: {url} "
                     f"(source: {source}, type: {content_type}, relevance: {relevance})"
+                    f"{reason_detail}"
                 )
+                record_outcome(url, success=False)
                 continue
 
             # Enrich parsed context with paper metadata for the writer
@@ -228,17 +299,20 @@ def node_extraction(state: AgentState) -> AgentState:
             )
 
             contexts.append(parsed)
+            record_outcome(url, success=True)
             logger.info("[Extraction] Success | paper=%d | url=%s", i, url)
 
         except json.JSONDecodeError as exc:
             err = f"JSON parse error for {url}: {exc}"
             logger.error("[Extraction] %s", err)
             errors.append(err)
+            record_outcome(url, success=False)
 
         except Exception as exc:
             err = f"Extraction failed for {url}: {exc}"
             logger.error("[Extraction] %s", err, exc_info=True)
             errors.append(err)
+            record_outcome(url, success=False)
 
     state["extracted_contexts"] = contexts
     state["extraction_errors"]  = errors
