@@ -12,6 +12,7 @@ from tools import (
     scholar_search,
     web_search,
 )
+from tools_impl.domain_reputation import get_reputation, is_domain_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,30 @@ def _sort_by_year(papers: list[PaperMeta]) -> list[PaperMeta]:
         key=lambda p: p.get("publication_year") or 0,
         reverse=True,
     )
+
+
+def _rank_by_domain_reputation(papers: list[PaperMeta]) -> list[PaperMeta]:
+    """
+    Reorders a batch of candidate papers so higher-reputation domains (per
+    tools_impl/domain_reputation.py's recorded extraction success rate) sort
+    first, and drops chronic-offender domains outright. This is a soft
+    re-ranking, not a hard cutoff for most domains — a domain we've barely
+    seen gets the neutral default score rather than being punished, so a
+    genuinely good but rarely-used source isn't unfairly buried.
+
+    Only applied to web-sourced candidates: Scholar/SerpApi results are
+    already high-quality by construction (prefer direct PDF links — see
+    scholar_search.py), so this feedback loop matters most for the more
+    variable Tavily web fill.
+    """
+    survivors = [p for p in papers if not is_domain_blocked(p.get("url", ""))]
+    dropped = len(papers) - len(survivors)
+    if dropped:
+        logger.info(
+            "[Discovery] Domain-reputation hard filter dropped %d chronic-offender result(s)",
+            dropped,
+        )
+    return sorted(survivors, key=lambda p: get_reputation(p.get("url", "")), reverse=True)
 
 
 def _parse_tool_output_to_papers(
@@ -268,6 +293,12 @@ def _collect_web_papers(
 ) -> tuple[list[PaperMeta], list[str], str]:
     """
     Tavily web search fill — runs until quota is met or all queries exhausted.
+
+    Each batch is passed through the domain-reputation cache before being
+    added to the running total: chronic-offender domains (many recorded
+    extraction failures) are dropped outright, and the remainder is sorted
+    so historically-reliable domains are preferred when later batches get
+    trimmed to the remaining quota. See tools_impl/domain_reputation.py.
     """
     papers:        list[PaperMeta] = []
     queries_fired: list[str]       = []
@@ -295,6 +326,7 @@ def _collect_web_papers(
                 continue
 
             batch = _parse_tool_output_to_papers(raw, source="web")
+            batch = _rank_by_domain_reputation(batch)
             papers.extend(batch)
             logger.info(
                 "[Discovery] Web batch done | query=%r | batch=%d | total=%d",
