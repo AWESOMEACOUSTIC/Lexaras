@@ -83,6 +83,19 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
+class RedirectDriftError(ValueError):
+    """
+    Raised when a fetch resolves to a generic homepage/root path after
+    following redirects, despite the requested URL targeting a specific
+    page — a strong signal the real content was never reached.
+
+    Kept as its own exception type (rather than a bare ValueError) so
+    callers can catch it specifically and tag the failure distinctly,
+    instead of it falling into a generic "unexpected error" bucket.
+    """
+    pass
+
+
 _network_retry = retry(
     retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout)),
     stop=stop_after_attempt(3),
@@ -122,7 +135,7 @@ def _fetch_with_retry(url: str) -> requests.Response:
     
     if resp.history:
         if _is_redirect_drift(url, resp.url):
-            raise ValueError(f"Redirect drift detected: {url} redirected to homepage {resp.url}")
+            raise RedirectDriftError(f"{url} redirected to homepage {resp.url}")
             
     return resp
 
@@ -155,3 +168,109 @@ def _result_envelope(
         Citations    : {cite_str}
         Snippet      : {snippet}
     """).strip()
+
+
+# ── Raw-content quality gate ─────────────────────────────────────────────────
+#
+# This runs on the ACTUAL scraped/extracted text, before it ever reaches an
+# LLM to summarize. The prior gate (see extraction.py's original
+# `_looks_like_wall`) only checked the LLM's own summary — which means a wall
+# page that gets paraphrased into plausible-sounding prose ("the publisher
+# requires an institutional subscription to view this content") can slip past
+# a check for literal phrases like "sign in to read", because the model never
+# reused those exact words. Checking the raw text closes that gap: the raw
+# HTML/PDF text of an access wall reliably DOES contain these phrases verbatim,
+# regardless of what the model later says about it.
+
+CONTENT_QUALITY_FLAG_PREFIX = "CONTENT_QUALITY_FLAG:"
+
+_WALL_MARKERS = (
+    "sign in to read", "purchase access", "institutional login",
+    "buy this article", "access through your institution",
+    "we use cookies", "cookie consent", "accept all cookies",
+    "subscribe to continue", "javascript is required",
+    "enable javascript", "verify you are human", "log in to continue",
+    "purchase pdf", "captcha", "checking your browser",
+)
+
+# Structural sanity thresholds. Deliberately lenient — the goal is to catch
+# obvious garbage (nav-menu dumps, cookie banners, link lists) without
+# rejecting legitimate dense academic prose, which can have long sentences
+# and technical vocabulary that looks unusual to a naive heuristic.
+_MIN_SENTENCES            = 4
+_MIN_UNIQUE_WORD_RATIO    = 0.28   # unique words / total words
+_MIN_AVG_WORDS_PER_SENTENCE = 3.0  # catches "Home | About | Contact" style dumps
+
+
+def _looks_like_wall(text: str) -> Optional[str]:
+    """
+    Cheap substring check for access-wall / consent-wall language.
+    Returns a reason string (naming the matched phrases) if flagged, else None.
+    """
+    lowered = text.lower()
+    hits = [m for m in _WALL_MARKERS if m in lowered]
+    if len(hits) >= 2 or (len(hits) >= 1 and len(text) < 2000):
+        return f"matched wall phrase(s): {', '.join(hits[:3])}"
+    return None
+
+
+def _structural_quality_ok(text: str) -> Optional[str]:
+    """
+    Cheap prose-shape check. Returns a reason string if the text doesn't look
+    like real article prose (e.g. a nav-menu/link-list dump, a mostly-empty
+    page, or heavily repeated boilerplate), else None.
+    """
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    words = re.findall(r"[A-Za-z']+", text.lower())
+
+    if len(sentences) < _MIN_SENTENCES:
+        return f"only {len(sentences)} sentence(s) detected (expected at least {_MIN_SENTENCES})"
+
+    if not words:
+        return "no words detected after cleaning"
+
+    unique_ratio = len(set(words)) / len(words)
+    if unique_ratio < _MIN_UNIQUE_WORD_RATIO:
+        return f"unique-word ratio {unique_ratio:.2f} is below {_MIN_UNIQUE_WORD_RATIO} (repetitive boilerplate)"
+
+    avg_words_per_sentence = len(words) / len(sentences)
+    if avg_words_per_sentence < _MIN_AVG_WORDS_PER_SENTENCE:
+        return (
+            f"average {avg_words_per_sentence:.1f} words/sentence is below "
+            f"{_MIN_AVG_WORDS_PER_SENTENCE} (looks like a link/nav list, not prose)"
+        )
+
+    return None
+
+
+def _quality_gate(text: str) -> Optional[str]:
+    """
+    Runs the wall-marker check and the structural sanity check, in that
+    order (cheapest first). Returns the first failure reason found, or None
+    if the text passes both.
+    """
+    wall_reason = _looks_like_wall(text)
+    if wall_reason:
+        return f"ACCESS_WALL_SUSPECTED — {wall_reason}"
+
+    structural_reason = _structural_quality_ok(text)
+    if structural_reason:
+        return f"LOW_QUALITY_TEXT — {structural_reason}"
+
+    return None
+
+
+def _gate_and_prefix(formatted_result: str) -> str:
+    """
+    Applies the quality gate to an already-formatted tool result string and,
+    if it fails, prepends a machine-readable flag line. Callers (scrape_url,
+    and by extension anything that wraps its output such as the PDF-delegate
+    branch) should route their final return value through this so the flag
+    is visible both to the calling LLM in-context and to a deterministic
+    downstream check (see extraction.py's raw ToolMessage scan).
+    """
+    reason = _quality_gate(formatted_result)
+    if reason:
+        logger.warning("[QualityGate] Flagged content: %s", reason)
+        return f"{CONTENT_QUALITY_FLAG_PREFIX} {reason}\n\n{formatted_result}"
+    return formatted_result
