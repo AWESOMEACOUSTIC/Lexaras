@@ -9,6 +9,8 @@ from tools_impl.helpers import (
     _clean_html,
     _trim_to_sentence,
     _is_valid_url,
+    _gate_and_prefix,
+    RedirectDriftError,
     MAX_SCRAPED_CHARS,
 )
 from tools_impl.extract_pdf import _extract_pdf_from_bytes
@@ -37,12 +39,21 @@ def scrape_url(url: str) -> str:
     Strips navigation, ads, scripts, and boilerplate.
     Transparently handles pages that redirect to a PDF.
     Use after scholar_search or web_search to deep-read a specific paper page.
+
+    The returned text may begin with a "CONTENT_QUALITY_FLAG:" line if the
+    page looks like an access wall, consent wall, or otherwise low-quality
+    scrape (e.g. a nav-menu dump) rather than genuine article content. Treat
+    that flag as authoritative — classify content_type accordingly rather
+    than trying to summarize past it.
     """
     logger.info("scrape_url | url=%s", url)
     start = time.perf_counter()
 
     try:
         response = _fetch_with_retry(url)
+    except RedirectDriftError as exc:
+        logger.warning("scrape_url redirect drift | url=%s | %s", url, exc)
+        return f"[REDIRECT_DRIFT] {exc}"
     except requests.exceptions.HTTPError as exc:
         status = exc.response.status_code if exc.response else "unknown"
         logger.warning("scrape_url HTTP error | url=%s | status=%s", url, status)
@@ -57,7 +68,8 @@ def scrape_url(url: str) -> str:
     content_type = response.headers.get("Content-Type", "")
     if "application/pdf" in content_type:
         logger.info("scrape_url detected PDF, delegating | url=%s", url)
-        return _extract_pdf_from_bytes(response.content, source_url=url)
+        pdf_result = _extract_pdf_from_bytes(response.content, source_url=url)
+        return _gate_and_prefix(pdf_result)
 
     text = _clean_html(response.text)
     if not text:
@@ -68,9 +80,15 @@ def scrape_url(url: str) -> str:
         "scrape_url complete | url=%s | chars=%d | elapsed=%.2fs",
         url, len(trimmed), time.perf_counter() - start,
     )
-    return (
+    formatted = (
         f"SOURCE: {url}\n"
         f"EXTRACTED CONTENT ({len(trimmed)} chars):\n"
         f"{'=' * 60}\n"
         f"{trimmed}"
     )
+    # Gate on the meaningful extracted text before returning — cheap
+    # wall-marker + structural checks, run on the RAW scraped content rather
+    # than anything an LLM has paraphrased. If flagged, a CONTENT_QUALITY_FLAG
+    # line is prepended so both the calling LLM and the deterministic check
+    # in extraction.py can see it.
+    return _gate_and_prefix(formatted)
