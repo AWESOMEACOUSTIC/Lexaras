@@ -43,6 +43,19 @@ _DEFAULT_REPUTATION = 0.6
 HARD_BLOCK_MIN_SAMPLES  = 5
 HARD_BLOCK_SUCCESS_RATE = 0.15
 
+KNOWN_PAYWALL_DOMAINS = {
+    "ieeexplore.ieee.org",
+    "dl.acm.org",
+    "springer.com",
+    "link.springer.com",
+    "nature.com",
+    "science.org",
+    "sciencedirect.com",
+    "taylorandfrancis.com",
+    "wiley.com",
+    "onepetro.org",
+}
+
 _lock = threading.Lock()
 _stats: dict[str, dict[str, int]] = {}
 _loaded = False
@@ -121,19 +134,26 @@ def get_reputation(url: str) -> float:
 
 def is_domain_blocked(url: str) -> bool:
     """
-    Chronic-offender hard filter — True only once a domain has accumulated
-    enough samples and its success rate is very low. Used as an optional,
-    stronger filter beyond the soft re-ranking `get_reputation` enables.
+    Efficiency shortcut — True if a domain is a known paywall (via seed list)
+    OR has accumulated enough samples to empirically show a very low success rate.
+    Used to skip direct scrape attempts and go straight to fallback methods.
     """
     _load()
     domain = _domain_of(url)
     entry = _stats.get(domain)
-    if not entry:
-        return False
-    total = entry["success"] + entry["failure"]
-    if total < HARD_BLOCK_MIN_SAMPLES:
-        return False
-    return (entry["success"] / total) < HARD_BLOCK_SUCCESS_RATE
+    
+    # If we have enough samples, trust the data over the seed list
+    if entry:
+        total = entry["success"] + entry["failure"]
+        if total >= HARD_BLOCK_MIN_SAMPLES:
+            return (entry["success"] / total) < HARD_BLOCK_SUCCESS_RATE
+            
+    # Otherwise, fall back to the seed list
+    for paywall in KNOWN_PAYWALL_DOMAINS:
+        if paywall in domain:
+            return True
+            
+    return False
 
 
 def reset_for_testing() -> None:
