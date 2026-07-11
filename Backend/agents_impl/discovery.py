@@ -13,6 +13,7 @@ from tools import (
     web_search,
 )
 from tools_impl.domain_reputation import get_reputation, is_domain_blocked
+from tools_impl.open_access import resolve_paper_oa
 
 logger = logging.getLogger(__name__)
 
@@ -55,24 +56,43 @@ def _rank_by_domain_reputation(papers: list[PaperMeta]) -> list[PaperMeta]:
     """
     Reorders a batch of candidate papers so higher-reputation domains (per
     tools_impl/domain_reputation.py's recorded extraction success rate) sort
-    first, and drops chronic-offender domains outright. This is a soft
-    re-ranking, not a hard cutoff for most domains — a domain we've barely
-    seen gets the neutral default score rather than being punished, so a
-    genuinely good but rarely-used source isn't unfairly buried.
-
-    Only applied to web-sourced candidates: Scholar/SerpApi results are
-    already high-quality by construction (prefer direct PDF links — see
-    scholar_search.py), so this feedback loop matters most for the more
-    variable Tavily web fill.
+    first. No longer drops chronic-offender domains, as we rely on the
+    OA resolver to rescue them.
+    
+    Only applied to web-sourced candidates.
     """
-    survivors = [p for p in papers if not is_domain_blocked(p.get("url", ""))]
-    dropped = len(papers) - len(survivors)
-    if dropped:
-        logger.info(
-            "[Discovery] Domain-reputation hard filter dropped %d chronic-offender result(s)",
-            dropped,
-        )
-    return sorted(survivors, key=lambda p: get_reputation(p.get("url", "")), reverse=True)
+    return sorted(papers, key=lambda p: get_reputation(p.get("url", "")), reverse=True)
+
+
+def _resolve_oa_for_batch(batch: list[PaperMeta]) -> list[PaperMeta]:
+    """
+    Run the OA resolver for each paper in a batch before counting towards quota.
+    """
+    KNOWN_RELIABLY_OPEN_DOMAINS = {"arxiv.org", "ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov"}
+    
+    for p in batch:
+        url = p.get("url", "").lower()
+        if any(d in url for d in KNOWN_RELIABLY_OPEN_DOMAINS):
+            p["oa_status"] = "not_needed"
+            p["tldr"] = None
+            continue
+            
+        title = p.get("title", "")
+        if not title or title == "Untitled":
+            p["oa_status"] = "not_found"
+            p["tldr"] = None
+            continue
+            
+        oa_res = resolve_paper_oa(title)
+        p["tldr"] = oa_res.get("tldr")
+        
+        if oa_res.get("oa_url"):
+            p["oa_status"] = "found"
+            p["url"] = oa_res["oa_url"]
+        else:
+            p["oa_status"] = "not_found"
+            
+    return batch
 
 
 def _parse_tool_output_to_papers(
@@ -272,6 +292,7 @@ def _collect_scholar_papers(
                     continue
 
                 batch = _parse_tool_output_to_papers(raw, source="scholar")
+                batch = _resolve_oa_for_batch(batch)
                 papers.extend(batch)
                 logger.info(
                     "[Discovery] Scholar window done | year=%d | batch=%d | total=%d",
@@ -326,6 +347,7 @@ def _collect_web_papers(
                 continue
 
             batch = _parse_tool_output_to_papers(raw, source="web")
+            batch = _resolve_oa_for_batch(batch)
             batch = _rank_by_domain_reputation(batch)
             papers.extend(batch)
             logger.info(
