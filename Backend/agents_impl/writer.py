@@ -101,6 +101,9 @@ _WRITER_HUMAN = textwrap.dedent("""
 
     Papers that failed to extract (note limitations):
     {errors_block}
+    
+    Recommended Further Reading (failed extraction but relevant):
+    {recommended_block}
 
     Write a comprehensive research report structured as:
 
@@ -111,7 +114,8 @@ _WRITER_HUMAN = textwrap.dedent("""
 
     ## Papers Analysed
     (For each paper: title, authors (year), URL, one sentence on why selected,
-     and whether it is a peer-reviewed Scholar result or a web source)
+     whether it is a peer-reviewed Scholar result or a web source, and its
+     Evidence Level [Full Text] or [Abstract Only])
 
     ## Key Findings
     (Minimum 6 detailed findings synthesised across all papers. Each finding:
@@ -127,6 +131,10 @@ _WRITER_HUMAN = textwrap.dedent("""
     ## Limitations of This Report
     (Gaps, failed extractions, paywalled papers, topic areas not covered,
      and any caveats about source diversity)
+
+    ## Recommended Further Reading
+    (If any papers were identified as relevant but could not be extracted due to
+     paywalls or access limits, list them here with their Title and URL.)
 
     ## Sources
     (Numbered list: [N] Authors (Year). Title. URL. [Scholar/Web])
@@ -275,6 +283,7 @@ def node_writer(state: AgentState) -> AgentState:
     """
     contexts = state.get("extracted_contexts", [])
     errors   = state.get("extraction_errors",  [])
+    recommended = state.get("recommended_reading", [])
     topic    = state["topic"]
     mode     = state["search_mode"]
     year_from = state["year_from"]
@@ -308,6 +317,7 @@ def node_writer(state: AgentState) -> AgentState:
             Authors  : {ctx.get('authors', 'Unknown')}
             Year     : {year_str}
             URL      : {ctx.get('url', 'N/A')}
+            EVIDENCE LEVEL: {ctx.get('evidence_level', 'full_text').replace('_', ' ').title()}
             SUMMARY  : {ctx.get('content_summary', '')}
             METHODOLOGY: {ctx.get('methodology', 'Not specified')}
             KEY POINTS:
@@ -320,6 +330,16 @@ def node_writer(state: AgentState) -> AgentState:
 
     contexts_block = "\n\n".join(contexts_block_parts)
     errors_block   = "\n".join(f"- {e}" for e in errors) if errors else "None"
+    
+    if recommended:
+        recommended_block_parts = []
+        for i, p in enumerate(recommended, 1):
+            recommended_block_parts.append(
+                f"{i}. Title: {p.get('title')}\n   URL: {p.get('url')}\n   Snippet: {p.get('snippet')}"
+            )
+        recommended_block = "\n\n".join(recommended_block_parts)
+    else:
+        recommended_block = "None"
 
     try:
         draft = _writer_chain.invoke({
@@ -331,6 +351,7 @@ def node_writer(state: AgentState) -> AgentState:
             "num_web":       num_web,
             "contexts_block": contexts_block,
             "errors_block":  errors_block,
+            "recommended_block": recommended_block,
         })
 
         # Self-critique / revise pass — never allowed to throw past this
