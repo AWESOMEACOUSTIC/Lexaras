@@ -13,6 +13,8 @@ class PaperMeta(TypedDict):
     source:           str            # "scholar" | "web"
     publication_year: Optional[int]  # None when unavailable
     authors:          Optional[str]  # None when unavailable
+    oa_status:        Optional[Literal["found", "not_found", "not_needed"]]
+    tldr:             Optional[str]
 
 
 class AgentState(TypedDict):
@@ -32,6 +34,7 @@ class AgentState(TypedDict):
     discovered_papers: list[PaperMeta]  # combined, deduped, ordered newest-first
     search_queries:    list[str]         # all queries that were fired
     discovery_raw:     str               # concatenated raw tool output (debug)
+    recommended_reading: list[PaperMeta] # papers that were relevant but completely failed extraction
 
     # ── Extraction outputs
     extracted_contexts: list[dict]   # {url, content_summary, key_points, ...}

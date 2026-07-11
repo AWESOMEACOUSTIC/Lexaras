@@ -9,7 +9,7 @@ from tools import READER_TOOLS
 from agents_impl.state import AgentState
 from agents_impl.llm import llm
 from tools_impl.helpers import CONTENT_QUALITY_FLAG_PREFIX
-from tools_impl.domain_reputation import record_outcome
+from tools_impl.domain_reputation import record_outcome, is_domain_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,7 @@ def node_extraction(state: AgentState) -> AgentState:
         logger.warning("[Extraction] No papers to extract from.")
         state["extracted_contexts"] = []
         state["extraction_errors"]  = []
+        state["recommended_reading"] = []
         return state
 
     logger.info("[Extraction] Starting | papers=%d | topic=%r", len(papers), topic)
@@ -200,6 +201,11 @@ def node_extraction(state: AgentState) -> AgentState:
             i, len(papers), source, pub_year, url,
         )
 
+        tldr = paper.get("tldr")
+        snippet = paper.get("snippet", "")
+        if tldr:
+            snippet = f"{snippet}\n\nSemantic Scholar TLDR: {tldr}"
+
         prompt = _EXTRACTION_HUMAN.format(
             topic    = topic,
             title    = title,
@@ -207,40 +213,46 @@ def node_extraction(state: AgentState) -> AgentState:
             source   = source.upper(),
             pub_year = pub_year or "Unknown",
             authors  = authors or "Unknown",
-            snippet  = paper.get("snippet", ""),
+            snippet  = snippet,
         )
 
         try:
-            result  = extraction_agent.invoke({
-                "messages": [HumanMessage(content=prompt)]
-            })
-            raw     = result["messages"][-1].content
-            cleaned = _strip_fences(raw)
-            parsed: dict = json.loads(cleaned)
+            if is_domain_blocked(url) and paper.get("oa_status") != "found":
+                logger.info("[Extraction] Skipping scrape for blocked paywall domain | url=%s", url)
+                content_type = "access_wall"
+                relevance = "medium"
+                usable = False
+                raw_flagged = False
+                summary = "[BLOCKED_PAYWALL]"
+                parsed = {}
+            else:
+                result  = extraction_agent.invoke({
+                    "messages": [HumanMessage(content=prompt)]
+                })
+                raw     = result["messages"][-1].content
+                cleaned = _strip_fences(raw)
+                parsed = json.loads(cleaned)
 
-            summary        = parsed.get("content_summary", "")
-            content_type   = parsed.get("content_type", "paper_content")
-            relevance      = parsed.get("topic_relevance", "high")
+                summary        = parsed.get("content_summary", "")
+                content_type   = parsed.get("content_type", "paper_content")
+                relevance      = parsed.get("topic_relevance", "high")
 
-            # Deterministic override: did the tool layer itself flag the raw
-            # scraped content as a wall / low-quality text, regardless of
-            # what the LLM's own classification says?
-            raw_flagged, raw_flag_reason = _raw_tool_output_flagged_quality_issue(
-                result["messages"]
-            )
+                raw_flagged, raw_flag_reason = _raw_tool_output_flagged_quality_issue(
+                    result["messages"]
+                )
 
-            usable = (
-                content_type in ("paper_content", "abstract_only")
-                and relevance in ("high", "medium")
-                and "[INSUFFICIENT_CONTENT]" not in summary
-                and len(summary) >= 100
-                and not _looks_like_wall(summary)
-                and not raw_flagged
-            )
+                usable = (
+                    content_type in ("paper_content", "abstract_only")
+                    and relevance in ("high", "medium")
+                    and "[INSUFFICIENT_CONTENT]" not in summary
+                    and len(summary) >= 100
+                    and not _looks_like_wall(summary)
+                    and not raw_flagged
+                )
 
             if not usable:
                 # ── Snippet-based fallback for Scholar papers ──────────────
-                snippet = paper.get("snippet", "").strip()
+                snippet_text = snippet.strip()
                 # Only fall back for access problems — if the content was read
                 # and judged off-topic, the snippet won't rescue it.
                 access_problem = (
@@ -248,8 +260,9 @@ def node_extraction(state: AgentState) -> AgentState:
                     or "[INSUFFICIENT_CONTENT]" in summary
                     or len(summary) < 100
                     or raw_flagged
+                    or summary == "[BLOCKED_PAYWALL]"
                 )
-                if source == "scholar" and len(snippet) > 50 and access_problem:
+                if source == "scholar" and len(snippet_text) > 50 and access_problem:
                     logger.info(
                         "[Extraction] Using snippet fallback for Scholar paper | url=%s",
                         url,
@@ -258,8 +271,8 @@ def node_extraction(state: AgentState) -> AgentState:
                         "url":                url,
                         "content_type":       "abstract_only",
                         "topic_relevance":    "medium",
-                        "content_summary":    f"[ABSTRACT_ONLY] {snippet}",
-                        "key_points":         [snippet] if snippet else [],
+                        "content_summary":    f"[ABSTRACT_ONLY] {snippet_text}",
+                        "key_points":         [snippet_text] if snippet_text else [],
                         "methodology":        "Not available — abstract only",
                         "citations":          [],
                         "relevance_to_topic": paper.get("relevance_note", "Relevance assessment unavailable."),
@@ -276,7 +289,7 @@ def node_extraction(state: AgentState) -> AgentState:
                     record_outcome(url, success=False)
                     continue
 
-                reason_detail = f" (raw-content flag: {raw_flag_reason})" if raw_flagged else ""
+                reason_detail = f" (raw-content flag: {raw_flag_reason})" if (not summary == "[BLOCKED_PAYWALL]" and raw_flagged) else ""
                 logger.warning(
                     "[Extraction] Rejected | type=%s relevance=%s url=%s%s",
                     content_type, relevance, url, reason_detail,
@@ -286,6 +299,12 @@ def node_extraction(state: AgentState) -> AgentState:
                     f"(source: {source}, type: {content_type}, relevance: {relevance})"
                     f"{reason_detail}"
                 )
+                
+                # Add to recommended reading if it was somewhat relevant
+                if relevance in ("high", "medium") or summary == "[BLOCKED_PAYWALL]":
+                    rec_list = state.setdefault("recommended_reading", [])
+                    rec_list.append(paper)
+                    
                 record_outcome(url, success=False)
                 continue
 
