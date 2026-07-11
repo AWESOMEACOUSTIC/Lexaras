@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # ── Tool Providers ────────────────────────────────────────────────────────
     TAVILY_API_KEY: str = Field(..., description="Tavily search API key")
     SERPAPI_API_KEY: str = Field(..., description="SerpApi key — required for Google Scholar search")
+    SEMANTIC_SCHOLAR_API_KEY: str | None = Field(None, description="Semantic Scholar API key (optional)")
 
     # ── Search behaviour ─────────────────────────────────────────────────────
     # "default"      → ACADEMIC_QUOTA papers from Scholar + remainder from Tavily
