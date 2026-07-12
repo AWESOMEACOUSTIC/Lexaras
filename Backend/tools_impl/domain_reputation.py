@@ -56,6 +56,12 @@ KNOWN_PAYWALL_DOMAINS = {
     "onepetro.org",
 }
 
+# Synthetic reputation bucket for extraction failures caused by the OA
+# resolver substituting the WRONG paper (see extraction._record_extraction_
+# outcome). Kept as a named constant so the sentinel URL can't be mistyped
+# if referenced from more than one call site.
+OA_RESOLVER_MISMATCH_BUCKET = "https://oa-resolver-mismatch.internal/"
+
 _lock = threading.Lock()
 _stats: dict[str, dict[str, int]] = {}
 _loaded = False
