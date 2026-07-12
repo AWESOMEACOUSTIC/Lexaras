@@ -9,7 +9,11 @@ from tools import READER_TOOLS
 from agents_impl.state import AgentState
 from agents_impl.llm import llm
 from tools_impl.helpers import CONTENT_QUALITY_FLAG_PREFIX
-from tools_impl.domain_reputation import record_outcome, is_domain_blocked
+from tools_impl.domain_reputation import (
+    record_outcome,
+    is_domain_blocked,
+    OA_RESOLVER_MISMATCH_BUCKET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +152,35 @@ def _raw_tool_output_flagged_quality_issue(messages: list) -> tuple[bool, str]:
     return False, ""
 
 
+def _record_extraction_outcome(paper: dict, url: str, success: bool,
+                               content_type: str = "") -> None:
+    """
+    Attribute reputation outcomes correctly:
+    - Success, or ordinary failure on a natural URL -> record against that URL.
+    - Failure on a resolver-substituted URL that turned out to be the WRONG
+      PAPER (unrelated_page) -> a resolver title-matching miss, not evidence
+      about the host's extractability. Record against the synthetic
+      OA_RESOLVER_MISMATCH_BUCKET so the host (e.g. arxiv.org) is not
+      penalised.
+
+    KNOWN RESIDUAL GAP: only catches mismatches that surface as
+    content_type == "unrelated_page". A wrong-paper swap that scrapes cleanly
+    and classifies as "paper_content" (merely low relevance) still records a
+    normal outcome against the host — and could log a false success. Fix 2's
+    title gate should make this rare; this is belt-and-braces, not a complete
+    guarantee.
+    """
+    was_resolved = bool(paper.get("original_url"))
+    if not success and was_resolved and content_type == "unrelated_page":
+        record_outcome(OA_RESOLVER_MISMATCH_BUCKET, success=False)
+        logger.info(
+            "[Extraction] Resolver mismatch — not penalising domain | url=%s",
+            url,
+        )
+        return
+    record_outcome(url, success=success)
+
+
 def node_extraction(state: AgentState) -> AgentState:
     """
     Extraction node — reads each discovered paper and pulls structured context.
@@ -263,6 +296,18 @@ def node_extraction(state: AgentState) -> AgentState:
                     or summary == "[BLOCKED_PAYWALL]"
                 )
                 if source == "scholar" and len(snippet_text) > 50 and access_problem:
+                    disc_rel = paper.get("discovery_relevance", "medium")
+                    if disc_rel in ("low", "none"):
+                        logger.info(
+                            "[Extraction] Snippet fallback refused — discovery "
+                            "rated relevance=%s | url=%s", disc_rel, url,
+                        )
+                        errors.append(
+                            f"Skipped snippet fallback ({disc_rel} relevance "
+                            f"per discovery): {url}"
+                        )
+                        _record_extraction_outcome(paper, url, False, content_type)
+                        continue
                     logger.info(
                         "[Extraction] Using snippet fallback for Scholar paper | url=%s",
                         url,
@@ -270,7 +315,7 @@ def node_extraction(state: AgentState) -> AgentState:
                     parsed = {
                         "url":                url,
                         "content_type":       "abstract_only",
-                        "topic_relevance":    "medium",
+                        "topic_relevance":    disc_rel,
                         "content_summary":    f"[ABSTRACT_ONLY] {snippet_text}",
                         "key_points":         [snippet_text] if snippet_text else [],
                         "methodology":        "Not available — abstract only",
@@ -286,7 +331,7 @@ def node_extraction(state: AgentState) -> AgentState:
                     # The scrape itself still failed (that's why we fell
                     # back) — record it as a domain failure even though the
                     # paper survives via the snippet.
-                    record_outcome(url, success=False)
+                    _record_extraction_outcome(paper, url, False, content_type)
                     continue
 
                 reason_detail = f" (raw-content flag: {raw_flag_reason})" if (not summary == "[BLOCKED_PAYWALL]" and raw_flagged) else ""
@@ -301,11 +346,15 @@ def node_extraction(state: AgentState) -> AgentState:
                 )
                 
                 # Add to recommended reading if it was somewhat relevant
-                if relevance in ("high", "medium") or summary == "[BLOCKED_PAYWALL]":
+                disc_rel = paper.get("discovery_relevance", "medium")
+                if (
+                    relevance in ("high", "medium")
+                    or summary == "[BLOCKED_PAYWALL]"
+                ) and disc_rel not in ("low", "none"):
                     rec_list = state.setdefault("recommended_reading", [])
                     rec_list.append(paper)
-                    
-                record_outcome(url, success=False)
+
+                _record_extraction_outcome(paper, url, False, content_type)
                 continue
 
             # Enrich parsed context with paper metadata for the writer
@@ -318,20 +367,20 @@ def node_extraction(state: AgentState) -> AgentState:
             )
 
             contexts.append(parsed)
-            record_outcome(url, success=True)
+            _record_extraction_outcome(paper, url, True, content_type)
             logger.info("[Extraction] Success | paper=%d | url=%s", i, url)
 
         except json.JSONDecodeError as exc:
             err = f"JSON parse error for {url}: {exc}"
             logger.error("[Extraction] %s", err)
             errors.append(err)
-            record_outcome(url, success=False)
+            _record_extraction_outcome(paper, url, False)
 
         except Exception as exc:
             err = f"Extraction failed for {url}: {exc}"
             logger.error("[Extraction] %s", err, exc_info=True)
             errors.append(err)
-            record_outcome(url, success=False)
+            _record_extraction_outcome(paper, url, False)
 
     state["extracted_contexts"] = contexts
     state["extraction_errors"]  = errors

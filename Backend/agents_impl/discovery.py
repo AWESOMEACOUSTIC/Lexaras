@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import textwrap
 import time
 from typing import Optional
@@ -13,7 +14,7 @@ from tools import (
     web_search,
 )
 from tools_impl.domain_reputation import get_reputation, is_domain_blocked
-from tools_impl.open_access import resolve_paper_oa
+from tools_impl.open_access import resolve_paper_oa, _is_known_open_host
 
 logger = logging.getLogger(__name__)
 
@@ -68,30 +69,31 @@ def _resolve_oa_for_batch(batch: list[PaperMeta]) -> list[PaperMeta]:
     """
     Run the OA resolver for each paper in a batch before counting towards quota.
     """
-    KNOWN_RELIABLY_OPEN_DOMAINS = {"arxiv.org", "ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov"}
-    
     for p in batch:
-        url = p.get("url", "").lower()
-        if any(d in url for d in KNOWN_RELIABLY_OPEN_DOMAINS):
+        url = p.get("url", "")
+        # Skip the resolver round-trip entirely for hosts open_access already
+        # trusts outright — same list the validator uses, so the two can't drift.
+        if _is_known_open_host(url):
             p["oa_status"] = "not_needed"
             p["tldr"] = None
             continue
-            
+
         title = p.get("title", "")
         if not title or title == "Untitled":
             p["oa_status"] = "not_found"
             p["tldr"] = None
             continue
-            
+
         oa_res = resolve_paper_oa(title)
         p["tldr"] = oa_res.get("tldr")
-        
+
         if oa_res.get("oa_url"):
             p["oa_status"] = "found"
+            p["original_url"] = p["url"]
             p["url"] = oa_res["oa_url"]
         else:
             p["oa_status"] = "not_found"
-            
+
     return batch
 
 
@@ -167,28 +169,40 @@ def _score_relevance_notes(
 
         For each paper below, write a single sentence explaining why it is or is not
         relevant to the research topic. Be specific. If it is not relevant, say so.
+        Also assign a relevance level: "high", "medium", "low", or "none".
+        Judge relevance against the ACTUAL research topic, not surface keyword
+        overlap — a paper that merely shares words with the topic but studies a
+        different subject is "low" or "none".
 
         Papers:
         {paper_list}
 
         Respond ONLY with valid JSON — a list of objects in the same order:
         [
-            {{"index": 1, "relevance_note": "..."}},
-            {{"index": 2, "relevance_note": "..."}}
+            {{"index": 1, "relevance_note": "...", "relevance": "high"}},
+            {{"index": 2, "relevance_note": "...", "relevance": "none"}}
         ]
     """).strip()
 
     try:
         raw = llm.invoke([HumanMessage(content=prompt)]).content
         notes: list[dict] = json.loads(_strip_fences(raw))
-        note_map = {item["index"]: item["relevance_note"] for item in notes}
+        note_map = {item["index"]: item for item in notes}
         for i, p in enumerate(papers, 1):
-            p["relevance_note"] = note_map.get(i, "Relevance assessment unavailable.")
+            item = note_map.get(i, {})
+            p["relevance_note"] = item.get(
+                "relevance_note", "Relevance assessment unavailable."
+            )
+            level = str(item.get("relevance", "medium")).lower()
+            p["discovery_relevance"] = (
+                level if level in ("high", "medium", "low", "none") else "medium"
+            )
     except Exception as exc:
         logger.warning("[Discovery] relevance scoring failed: %s", exc)
         for p in papers:
             if not p.get("relevance_note"):
                 p["relevance_note"] = "Relevance assessment unavailable."
+            p.setdefault("discovery_relevance", "medium")
 
     return papers
 
@@ -208,6 +222,18 @@ _QUERY_GEN_PROMPT = textwrap.dedent("""
         - Empirical studies / experimental results
         - Recent advances / state of the art (use terms like "2023 2024 2025")
         - Key authors or landmark papers (if you know them)
+
+    QUERY SYNTAX RULES (important):
+    - These queries go to Google Scholar and general web search, which are
+      KEYWORD engines. Do NOT use boolean operators (AND, OR, NOT) or
+      parentheses — a literal "AND" is matched as a keyword and hurts
+      precision.
+    - Write natural keyword phrases, e.g.:
+      GOOD: autonomous agent payment protocol x402
+      BAD:  "autonomous agents" AND "payment applications" AND integration
+    - Quoted phrases are allowed only for genuine multi-word terms of art
+      (e.g. "agentic commerce"), at most one per query.
+    - Keep each query to 3-8 words.
 
     If retry_count > 0, the previous queries returned too few results.
     Broaden the queries: use synonyms, parent concepts, or adjacent fields.
@@ -235,7 +261,15 @@ def _generate_queries(topic: str, search_mode: str, retry_count: int) -> list[st
         queries: list[str] = json.loads(_strip_fences(raw))
         if not isinstance(queries, list) or not queries:
             raise ValueError("LLM returned empty or non-list queries")
-        return [str(q).strip() for q in queries if str(q).strip()]
+        cleaned = []
+        for q in queries:
+            q = str(q).strip()
+            if not q:
+                continue
+            # Strip literal boolean operators the LLM may still emit.
+            q = re.sub(r"\s+\b(AND|OR|NOT)\b\s+", " ", q).strip()
+            cleaned.append(q)
+        return cleaned or [topic]
     except Exception as exc:
         logger.warning("[Discovery] query generation failed (%s), using topic as fallback", exc)
         return [topic]
